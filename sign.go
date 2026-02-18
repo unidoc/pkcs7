@@ -283,10 +283,6 @@ func (sd *SignedData) addSignerChain(ee *x509.Certificate, pkey crypto.PrivateKe
 		sd.certs = append(sd.certs, chain...)
 	}
 
-	if len(chain) > 0 {
-		sd.certs = append(sd.certs, chain...)
-	}
-
 	return nil
 }
 
