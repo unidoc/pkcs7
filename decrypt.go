@@ -12,10 +12,13 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+
+	"github.com/unidoc/pkcs7/internal/rc2"
 )
 
-// ErrUnsupportedAlgorithm tells you when our quick dev assumptions have failed
-var ErrUnsupportedAlgorithm = errors.New("pkcs7: cannot decrypt data: only RSA, DES, DES-EDE3, AES-256-CBC and AES-128-GCM supported")
+// ErrUnsupportedAlgorithm is returned when the key transport or content
+// encryption algorithm is not one this package implements.
+var ErrUnsupportedAlgorithm = errors.New("pkcs7: cannot decrypt data: only RSA key transport with DES-CBC, DES-EDE3-CBC, AES-CBC, AES-GCM or RC2-CBC content encryption is supported")
 
 // ErrNotEncryptedContent is returned when attempting to Decrypt data that is not encrypted data
 var ErrNotEncryptedContent = errors.New("pkcs7: content data is a decryptable data type")
@@ -52,17 +55,43 @@ func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
 	return data.EncryptedContentInfo.decrypt(key)
 }
 
+// rc2EffectiveKeyBits maps the RC2 parameter version to the effective key
+// length in bits (RFC 2268 §6). Values of 256 and above are the key length
+// itself; below 256 only the three well-known table entries are recognised,
+// which is what OpenSSL accepts as well.
+func rc2EffectiveKeyBits(version int) (int, error) {
+	switch {
+	case version >= 256:
+		return version, nil
+	case version == 160:
+		return 40, nil
+	case version == 120:
+		return 64, nil
+	case version == 58:
+		return 128, nil
+	}
+	return 0, fmt.Errorf("pkcs7: unsupported RC2 parameter version %d", version)
+}
+
+// rc2Params decodes RC2-CBC-Parameter, which is either a bare 8-byte IV
+// (effective key length 32 bits) or SEQUENCE { version, iv }.
+func rc2Params(params asn1.RawValue) (iv []byte, effectiveBits int, err error) {
+	if params.Tag == asn1.TagOctetString && params.Class == asn1.ClassUniversal {
+		return params.Bytes, 32, nil
+	}
+	var p rc2CBCParameters
+	if _, err := asn1.Unmarshal(params.FullBytes, &p); err != nil {
+		return nil, 0, fmt.Errorf("pkcs7: malformed RC2 parameters: %v", err)
+	}
+	bits, err := rc2EffectiveKeyBits(p.Version)
+	if err != nil {
+		return nil, 0, err
+	}
+	return p.IV, bits, nil
+}
+
 func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	alg := eci.ContentEncryptionAlgorithm.Algorithm
-	if !alg.Equal(OIDEncryptionAlgorithmDESCBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES256CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES128CBC) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES128GCM) &&
-		!alg.Equal(OIDEncryptionAlgorithmAES256GCM) {
-		fmt.Printf("Unsupported Content Encryption Algorithm: %s\n", alg)
-		return nil, ErrUnsupportedAlgorithm
-	}
 
 	// EncryptedContent can either be constructed of multple OCTET STRINGs
 	// or _be_ a tagged OCTET STRING
@@ -87,16 +116,31 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 
 	var block cipher.Block
 	var err error
+	// iv is the CBC initialisation vector; nil until the algorithm's
+	// parameters have been decoded.
+	var iv []byte
 
 	switch {
 	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
 		block, err = des.NewCipher(key)
+		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
 	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
 		block, err = des.NewTripleDESCipher(key)
+		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
 	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
 		fallthrough
 	case alg.Equal(OIDEncryptionAlgorithmAES128GCM), alg.Equal(OIDEncryptionAlgorithmAES128CBC):
 		block, err = aes.NewCipher(key)
+		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
+	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
+		var bits int
+		iv, bits, err = rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
+		if err != nil {
+			return nil, err
+		}
+		block, err = rc2.New(key, bits)
+	default:
+		return nil, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg)
 	}
 
 	if err != nil {
@@ -132,7 +176,6 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 		return plaintext, nil
 	}
 
-	iv := eci.ContentEncryptionAlgorithm.Parameters.Bytes
 	if len(iv) != block.BlockSize() {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
 	}

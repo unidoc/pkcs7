@@ -85,6 +85,7 @@ var (
 	OIDEncryptionAlgorithmAES128GCM  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 6}
 	OIDEncryptionAlgorithmAES128CBC  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
 	OIDEncryptionAlgorithmAES256GCM  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 46}
+	OIDEncryptionAlgorithmRC2CBC     = asn1.ObjectIdentifier{1, 2, 840, 113549, 3, 2}
 )
 
 func getHashForOID(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
