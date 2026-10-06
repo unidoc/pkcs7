@@ -61,3 +61,18 @@ func TestBer2Der_Negatives(t *testing.T) {
 		}
 	}
 }
+
+func TestParseMalformedBERNoPanic(t *testing.T) {
+	// Truncated and malformed BER headers must make Parse return an error.
+	fixtures := [][]byte{
+		{0x1F, 0x80},
+		{0x1F, 0x05},
+		{0x30, 0x81},
+		{0x30, 0x84, 0x01},
+	}
+	for _, in := range fixtures {
+		if _, err := Parse(in); err == nil {
+			t.Errorf("Parse(% X): expected error, got nil", in)
+		}
+	}
+}
