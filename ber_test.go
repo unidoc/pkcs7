@@ -63,9 +63,7 @@ func TestBer2Der_Negatives(t *testing.T) {
 }
 
 func TestParseMalformedBERNoPanic(t *testing.T) {
-	// Regression inputs from mozilla-services/pkcs7 (GHSA-mq3g-qwhv-4hgw): tiny
-	// malformed BER that made the upstream parser read out of bounds. Parse
-	// must return an error, never panic.
+	// Truncated and malformed BER headers must make Parse return an error.
 	fixtures := [][]byte{
 		{0x1F, 0x80},
 		{0x1F, 0x05},
