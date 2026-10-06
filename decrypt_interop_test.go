@@ -3,6 +3,7 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/cipher"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/unidoc/pkcs7/internal/rc2"
 )
 
 // loadTestIdentity reads testdata/<name>.crt and testdata/<name>.key (PKCS#8).
@@ -220,5 +223,75 @@ func TestDecryptUnsupportedAlgorithmError(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("1.2.3.4")) {
 		t.Errorf("error should name the OID: %v", err)
+	}
+}
+
+// rc2EncryptedContent builds an RC2-CBC encryptedContentInfo directly, so
+// that parameter and key shapes the encrypt side never produces can be fed
+// to decrypt.
+func rc2EncryptedContent(t *testing.T, key []byte, effectiveBits int, params []byte, plaintext []byte) encryptedContentInfo {
+	t.Helper()
+	block, err := rc2.New(key, effectiveBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iv := make([]byte, 8)
+	padded, _ := pad(plaintext, 8)
+	ct := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, padded)
+	var raw asn1.RawValue
+	if _, err := asn1.Unmarshal(params, &raw); err != nil {
+		t.Fatal(err)
+	}
+	return encryptedContentInfo{
+		ContentType:                OIDData,
+		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: OIDEncryptionAlgorithmRC2CBC, Parameters: raw},
+		EncryptedContent:           asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, Bytes: ct},
+	}
+}
+
+// TestDecryptRC2BareIVParameters covers the first alternative of
+// RC2-CBCParameter (RFC 2268 §6): a bare 8-byte IV, meaning 32 effective
+// key bits. The SEQUENCE form always carries a version.
+func TestDecryptRC2BareIVParameters(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	ivParam, _ := asn1.Marshal(make([]byte, 8))
+	eci := rc2EncryptedContent(t, key, 32, ivParam, []byte("bare iv"))
+	got, err := eci.decrypt(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "bare iv" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// TestDecryptRC2RejectsOutOfRangeInputs: the content key and the parameter
+// version come from the envelope, and the RC2 key schedule panics on an
+// empty key, a key over 128 bytes or more than 1024 effective bits.
+func TestDecryptRC2RejectsOutOfRangeInputs(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	okParams, _ := asn1.Marshal(rc2CBCParameters{Version: rc2Version128, IV: make([]byte, 8)})
+	eci := rc2EncryptedContent(t, key, 128, okParams, []byte("x"))
+
+	for _, bad := range [][]byte{nil, make([]byte, 129)} {
+		if _, err := eci.decrypt(bad); err == nil {
+			t.Errorf("key of %d bytes: expected error", len(bad))
+		}
+	}
+
+	for _, version := range []int{1025, 4096, 0, 7} {
+		params, _ := asn1.Marshal(rc2CBCParameters{Version: version, IV: make([]byte, 8)})
+		var raw asn1.RawValue
+		asn1.Unmarshal(params, &raw)
+		eci.ContentEncryptionAlgorithm.Parameters = raw
+		if _, err := eci.decrypt(key); err == nil {
+			t.Errorf("version %d: expected error", version)
+		}
+	}
+
+	// The upper bound itself is valid.
+	if _, err := rc2EffectiveKeyBits(1024); err != nil {
+		t.Errorf("version 1024: %v", err)
 	}
 }

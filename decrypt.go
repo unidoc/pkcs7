@@ -55,13 +55,21 @@ func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
 	return data.EncryptedContentInfo.decrypt(key)
 }
 
+// rc2MaxKeyBytes and rc2MaxEffectiveBits are the limits of the RC2 key
+// schedule (RFC 2268 §2): the key is 1 to 128 bytes and the effective key
+// length 1 to 1024 bits. The cipher implementation does not check them.
+const (
+	rc2MaxKeyBytes      = 128
+	rc2MaxEffectiveBits = 1024
+)
+
 // rc2EffectiveKeyBits maps the RC2 parameter version to the effective key
-// length in bits (RFC 2268 §6). Values of 256 and above are the key length
+// length in bits (RFC 2268 §6). Values from 256 to 1024 are the key length
 // itself; below 256 only the three well-known table entries are recognised,
 // which is what OpenSSL accepts as well.
 func rc2EffectiveKeyBits(version int) (int, error) {
 	switch {
-	case version >= 256:
+	case version >= 256 && version <= rc2MaxEffectiveBits:
 		return version, nil
 	case version == 160:
 		return 40, nil
@@ -133,6 +141,12 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 		block, err = aes.NewCipher(key)
 		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
 	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
+		// The key and the parameters come from the envelope, so both are
+		// attacker-controlled; the RC2 implementation panics outside these
+		// ranges.
+		if len(key) < 1 || len(key) > rc2MaxKeyBytes {
+			return nil, fmt.Errorf("pkcs7: invalid RC2 key length %d", len(key))
+		}
 		var bits int
 		iv, bits, err = rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
 		if err != nil {
