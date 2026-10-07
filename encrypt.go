@@ -12,6 +12,8 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+
+	"github.com/unidoc/pkcs7/internal/rc2"
 )
 
 type envelopedData struct {
@@ -35,8 +37,21 @@ type recipientInfo struct {
 type encryptedContentInfo struct {
 	ContentType                asn1.ObjectIdentifier
 	ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
-	EncryptedContent           asn1.RawValue `asn1:"tag:0,optional,explicit"`
+	// EncryptedContent is [0] IMPLICIT OCTET STRING (RFC 5652 §6.1). It is
+	// parsed as an implicitly tagged raw value so that both the primitive
+	// and the constructed [0] encodings are accepted.
+	EncryptedContent asn1.RawValue `asn1:"tag:0,optional"`
 }
+
+// rc2CBCParameters is the RC2-CBC-Parameter SEQUENCE form from RFC 2268 §6.
+type rc2CBCParameters struct {
+	Version int
+	IV      []byte
+}
+
+// rc2Version128 is the RC2 parameter version that encodes an effective key
+// length of 128 bits (RFC 2268 §6).
+const rc2Version128 = 58
 
 const (
 	// EncryptionAlgorithmDESCBC is the DES CBC encryption algorithm
@@ -55,6 +70,11 @@ const (
 
 	// EncryptionAlgorithmAES256GCM is the AES 256 bits with GCM encryption algorithm
 	EncryptionAlgorithmAES256GCM
+
+	// EncryptionAlgorithmRC2CBC is RC2 in CBC mode with a 128-bit key.
+	// Legacy algorithm; use it only for interoperability with consumers that
+	// accept nothing newer (PDF public-key security handlers, for example).
+	EncryptionAlgorithmRC2CBC
 )
 
 // ContentEncryptionAlgorithm determines the algorithm used to encrypt the
@@ -64,7 +84,7 @@ var ContentEncryptionAlgorithm = EncryptionAlgorithmDESCBC
 
 // ErrUnsupportedEncryptionAlgorithm is returned when attempting to encrypt
 // content with an unsupported algorithm.
-var ErrUnsupportedEncryptionAlgorithm = errors.New("pkcs7: cannot encrypt content: only DES-CBC, AES-CBC, and AES-GCM supported")
+var ErrUnsupportedEncryptionAlgorithm = errors.New("pkcs7: cannot encrypt content: only DES-CBC, AES-CBC, AES-GCM and RC2-CBC supported")
 
 // ErrPSKNotProvided is returned when attempting to encrypt
 // using a PSK without actually providing the PSK.
@@ -77,10 +97,10 @@ type aesGCMParameters struct {
 	ICVLen int
 }
 
-func encryptAESGCM(content []byte, key []byte) ([]byte, *encryptedContentInfo, error) {
+func encryptAESGCM(content []byte, key []byte, alg int) ([]byte, *encryptedContentInfo, error) {
 	var keyLen int
 	var algID asn1.ObjectIdentifier
-	switch ContentEncryptionAlgorithm {
+	switch alg {
 	case EncryptionAlgorithmAES128GCM:
 		keyLen = 16
 		algID = OIDEncryptionAlgorithmAES128GCM
@@ -88,7 +108,7 @@ func encryptAESGCM(content []byte, key []byte) ([]byte, *encryptedContentInfo, e
 		keyLen = 32
 		algID = OIDEncryptionAlgorithmAES256GCM
 	default:
-		return nil, nil, fmt.Errorf("invalid ContentEncryptionAlgorithm in encryptAESGCM: %d", ContentEncryptionAlgorithm)
+		return nil, nil, fmt.Errorf("invalid content encryption algorithm in encryptAESGCM: %d", alg)
 	}
 	if key == nil {
 		// Create AES key
@@ -191,10 +211,10 @@ func encryptDESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, e
 	return key, &eci, nil
 }
 
-func encryptAESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, error) {
+func encryptAESCBC(content []byte, key []byte, alg int) ([]byte, *encryptedContentInfo, error) {
 	var keyLen int
 	var algID asn1.ObjectIdentifier
-	switch ContentEncryptionAlgorithm {
+	switch alg {
 	case EncryptionAlgorithmAES128CBC:
 		keyLen = 16
 		algID = OIDEncryptionAlgorithmAES128CBC
@@ -202,7 +222,7 @@ func encryptAESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, e
 		keyLen = 32
 		algID = OIDEncryptionAlgorithmAES256CBC
 	default:
-		return nil, nil, fmt.Errorf("invalid ContentEncryptionAlgorithm in encryptAESCBC: %d", ContentEncryptionAlgorithm)
+		return nil, nil, fmt.Errorf("invalid content encryption algorithm in encryptAESCBC: %d", alg)
 	}
 
 	if key == nil {
@@ -248,34 +268,88 @@ func encryptAESCBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, e
 	return key, &eci, nil
 }
 
+// encryptRC2CBC encrypts content with RC2-CBC using a 128-bit key and an
+// effective key length of 128 bits, the parameters PDF public-key security
+// handlers (Acrobat, PDFBox) emit.
+func encryptRC2CBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, error) {
+	if key == nil {
+		key = make([]byte, 16)
+		if _, err := rand.Read(key); err != nil {
+			return nil, nil, err
+		}
+	}
+	// The parameters below declare rc2Version128, so the key schedule must
+	// use 128 effective bits from a 16-byte key.
+	if len(key) != 16 {
+		return nil, nil, fmt.Errorf("pkcs7: RC2-CBC requires a 16-byte key, got %d", len(key))
+	}
+
+	iv := make([]byte, rc2.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, nil, err
+	}
+
+	block, err := rc2.New(key, 128)
+	if err != nil {
+		return nil, nil, err
+	}
+	mode := cipher.NewCBCEncrypter(block, iv)
+	plaintext, err := pad(content, mode.BlockSize())
+	if err != nil {
+		return nil, nil, err
+	}
+	cyphertext := make([]byte, len(plaintext))
+	mode.CryptBlocks(cyphertext, plaintext)
+
+	paramBytes, err := asn1.Marshal(rc2CBCParameters{Version: rc2Version128, IV: iv})
+	if err != nil {
+		return nil, nil, err
+	}
+	eci := encryptedContentInfo{
+		ContentType: OIDData,
+		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+			Algorithm:  OIDEncryptionAlgorithmRC2CBC,
+			Parameters: asn1.RawValue{FullBytes: paramBytes},
+		},
+		EncryptedContent: marshalEncryptedContent(cyphertext),
+	}
+	return key, &eci, nil
+}
+
 // Encrypt creates and returns an envelope data PKCS7 structure with encrypted
 // recipient keys for each recipient public key.
 //
 // The algorithm used to perform encryption is determined by the current value
 // of the global ContentEncryptionAlgorithm package variable. By default, the
-// value is EncryptionAlgorithmDESCBC. To use a different algorithm, change the
-// value before calling Encrypt(). For example:
-//
-//     ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
-//
-// TODO(fullsailor): Add support for encrypting content with other algorithms
+// value is EncryptionAlgorithmDESCBC. Library code should call
+// EncryptWithAlgorithm instead, which takes the algorithm as an argument and
+// does not depend on shared mutable state.
 func Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+	return EncryptWithAlgorithm(content, recipients, ContentEncryptionAlgorithm)
+}
+
+// EncryptWithAlgorithm creates and returns an envelope data PKCS7 structure
+// with encrypted recipient keys for each recipient public key, using alg (one
+// of the EncryptionAlgorithm* constants) as the content encryption algorithm.
+func EncryptWithAlgorithm(content []byte, recipients []*x509.Certificate, alg int) ([]byte, error) {
 	var eci *encryptedContentInfo
 	var key []byte
 	var err error
 
 	// Apply chosen symmetric encryption method
-	switch ContentEncryptionAlgorithm {
+	switch alg {
 	case EncryptionAlgorithmDESCBC:
 		key, eci, err = encryptDESCBC(content, nil)
 	case EncryptionAlgorithmAES128CBC:
 		fallthrough
 	case EncryptionAlgorithmAES256CBC:
-		key, eci, err = encryptAESCBC(content, nil)
+		key, eci, err = encryptAESCBC(content, nil, alg)
 	case EncryptionAlgorithmAES128GCM:
 		fallthrough
 	case EncryptionAlgorithmAES256GCM:
-		key, eci, err = encryptAESGCM(content, nil)
+		key, eci, err = encryptAESGCM(content, nil, alg)
+	case EncryptionAlgorithmRC2CBC:
+		key, eci, err = encryptRC2CBC(content, nil)
 
 	default:
 		return nil, ErrUnsupportedEncryptionAlgorithm
@@ -345,7 +419,7 @@ func EncryptUsingPSK(content []byte, key []byte) ([]byte, error) {
 	case EncryptionAlgorithmAES128GCM:
 		fallthrough
 	case EncryptionAlgorithmAES256GCM:
-		_, eci, err = encryptAESGCM(content, key)
+		_, eci, err = encryptAESGCM(content, key, ContentEncryptionAlgorithm)
 
 	default:
 		return nil, ErrUnsupportedEncryptionAlgorithm
@@ -374,9 +448,12 @@ func EncryptUsingPSK(content []byte, key []byte) ([]byte, error) {
 	return asn1.Marshal(wrapper)
 }
 
+// marshalEncryptedContent encodes the ciphertext as the primitive
+// [0] IMPLICIT OCTET STRING that RFC 5652 §6.1 specifies for
+// EncryptedContentInfo.encryptedContent; decrypt also accepts the
+// constructed form.
 func marshalEncryptedContent(content []byte) asn1.RawValue {
-	asn1Content, _ := asn1.Marshal(content)
-	return asn1.RawValue{Tag: 0, Class: 2, Bytes: asn1Content, IsCompound: true}
+	return asn1.RawValue{Tag: 0, Class: asn1.ClassContextSpecific, Bytes: content}
 }
 
 func encryptKey(key []byte, recipient *x509.Certificate) ([]byte, error) {
