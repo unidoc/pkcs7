@@ -39,8 +39,7 @@ type encryptedContentInfo struct {
 	ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
 	// EncryptedContent is [0] IMPLICIT OCTET STRING (RFC 5652 §6.1). It is
 	// parsed as an implicitly tagged raw value so that both the primitive
-	// form written by OpenSSL, BouncyCastle and Acrobat and the constructed
-	// form written by versions of this package before v0.4.0 are accepted.
+	// and the constructed [0] encodings are accepted.
 	EncryptedContent asn1.RawValue `asn1:"tag:0,optional"`
 }
 
@@ -279,13 +278,18 @@ func encryptRC2CBC(content []byte, key []byte) ([]byte, *encryptedContentInfo, e
 			return nil, nil, err
 		}
 	}
+	// The parameters below declare rc2Version128, so the key schedule must
+	// use 128 effective bits from a 16-byte key.
+	if len(key) != 16 {
+		return nil, nil, fmt.Errorf("pkcs7: RC2-CBC requires a 16-byte key, got %d", len(key))
+	}
 
 	iv := make([]byte, rc2.BlockSize)
 	if _, err := rand.Read(iv); err != nil {
 		return nil, nil, err
 	}
 
-	block, err := rc2.New(key, len(key)*8)
+	block, err := rc2.New(key, 128)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -446,8 +450,8 @@ func EncryptUsingPSK(content []byte, key []byte) ([]byte, error) {
 
 // marshalEncryptedContent encodes the ciphertext as the primitive
 // [0] IMPLICIT OCTET STRING that RFC 5652 §6.1 specifies for
-// EncryptedContentInfo.encryptedContent. Versions before v0.4.0 wrapped it in
-// a constructed [0]; decrypt still accepts that form.
+// EncryptedContentInfo.encryptedContent; decrypt also accepts the
+// constructed form.
 func marshalEncryptedContent(content []byte) asn1.RawValue {
 	return asn1.RawValue{Tag: 0, Class: asn1.ClassContextSpecific, Bytes: content}
 }

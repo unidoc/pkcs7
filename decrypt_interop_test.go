@@ -54,9 +54,9 @@ func mustHex(t *testing.T, s string) []byte {
 }
 
 // TestDecryptInterop decrypts EnvelopedData produced by other
-// implementations. All of them encode EncryptedContent as the primitive
-// [0] IMPLICIT OCTET STRING of RFC 5652, which versions before v0.4.0 could
-// not parse; the PDFBox one additionally uses RC2-CBC.
+// implementations: primitive [0] IMPLICIT OCTET STRING content from OpenSSL
+// and BouncyCastle (the PDFBox one with RC2-CBC), plus this package's own
+// constructed-form output.
 func TestDecryptInterop(t *testing.T) {
 	const counting = "000102030405060708090a0b0c0d0e0f1011121314151617"
 	tests := []struct {
@@ -210,8 +210,7 @@ func TestRC2EffectiveKeyBits(t *testing.T) {
 }
 
 // TestDecryptUnsupportedAlgorithmError checks the error names the algorithm
-// and wraps ErrUnsupportedAlgorithm (and that nothing is printed to stdout,
-// which the previous implementation did).
+// and wraps ErrUnsupportedAlgorithm.
 func TestDecryptUnsupportedAlgorithmError(t *testing.T) {
 	eci := encryptedContentInfo{
 		ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: asn1.ObjectIdentifier{1, 2, 3, 4}},
@@ -293,5 +292,79 @@ func TestDecryptRC2RejectsOutOfRangeInputs(t *testing.T) {
 	// The upper bound itself is valid.
 	if _, err := rc2EffectiveKeyBits(1024); err != nil {
 		t.Errorf("version 1024: %v", err)
+	}
+}
+
+// TestDecryptRejectsMalformedCiphertext: the ciphertext and its padding come
+// from the envelope. A length that is not a whole number of blocks, a
+// padding byte outside 1..blocksize, or a constructed [0] with a chunk that
+// is not an OCTET STRING must produce an error, not a panic.
+func TestDecryptRejectsMalformedCiphertext(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	params, _ := asn1.Marshal(rc2CBCParameters{Version: rc2Version128, IV: make([]byte, 8)})
+	eci := rc2EncryptedContent(t, key, 128, params, []byte("x"))
+
+	primitive := func(ct []byte) asn1.RawValue {
+		return asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, Bytes: ct}
+	}
+
+	eci.EncryptedContent = primitive(make([]byte, 7))
+	if _, err := eci.decrypt(key); err == nil {
+		t.Error("7-byte ciphertext: expected error")
+	}
+	eci.EncryptedContent = primitive(nil)
+	if _, err := eci.decrypt(key); err == nil {
+		t.Error("empty ciphertext: expected error")
+	}
+
+	// Every possible last plaintext byte of a tampered block: the padding
+	// check must reject or accept, never index out of range.
+	for b := 0; b < 256; b++ {
+		ct := make([]byte, 8)
+		ct[7] = byte(b)
+		eci.EncryptedContent = primitive(ct)
+		eci.decrypt(key)
+	}
+
+	// Constructed [0] whose second chunk is an INTEGER, not an OCTET STRING.
+	chunk, _ := asn1.Marshal(make([]byte, 8))
+	eci.EncryptedContent = asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, IsCompound: true,
+		Bytes: append(chunk, 0x02, 0x01, 0x05)}
+	if _, err := eci.decrypt(key); err == nil {
+		t.Error("constructed content with a non-OCTET STRING chunk: expected error")
+	}
+}
+
+func TestUnpad(t *testing.T) {
+	for _, tc := range []struct {
+		data []byte
+		ok   bool
+	}{
+		{[]byte{1, 2, 3, 4, 5, 6, 7, 1}, true},
+		{[]byte{1, 2, 3, 4, 4, 4, 4, 4}, true},
+		{[]byte{8, 8, 8, 8, 8, 8, 8, 8}, true},
+		{[]byte{1, 2, 3, 4, 5, 6, 7, 0}, false},   // zero padding length
+		{[]byte{1, 2, 3, 4, 5, 6, 7, 9}, false},   // longer than the block
+		{[]byte{1, 2, 3, 4, 5, 6, 3, 2}, false},   // inconsistent bytes
+		{[]byte{1, 2, 3, 4, 5, 6, 7}, false},      // not a whole block
+		{[]byte{1, 2, 3, 4, 5, 6, 7, 255}, false}, // would index before the slice
+	} {
+		_, err := unpad(tc.data, 8)
+		if (err == nil) != tc.ok {
+			t.Errorf("unpad(% X): err=%v, want ok=%v", tc.data, err, tc.ok)
+		}
+	}
+}
+
+// TestEncryptRC2RejectsWrongKeyLength: the RC2 parameters always declare 128
+// effective bits, so a caller-supplied key must be 16 bytes.
+func TestEncryptRC2RejectsWrongKeyLength(t *testing.T) {
+	for _, n := range []int{8, 24} {
+		if _, _, err := encryptRC2CBC([]byte("x"), make([]byte, n)); err == nil {
+			t.Errorf("%d-byte key: expected error", n)
+		}
+	}
+	if _, _, err := encryptRC2CBC([]byte("x"), make([]byte, 16)); err != nil {
+		t.Errorf("16-byte key: %v", err)
 	}
 }

@@ -108,13 +108,14 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 		// Complex case to concat all of the children OCTET STRINGs
 		var buf bytes.Buffer
 		cypherbytes := eci.EncryptedContent.Bytes
-		for {
+		for len(cypherbytes) > 0 {
 			var part []byte
-			cypherbytes, _ = asn1.Unmarshal(cypherbytes, &part)
-			buf.Write(part)
-			if cypherbytes == nil {
-				break
+			rest, err := asn1.Unmarshal(cypherbytes, &part)
+			if err != nil {
+				return nil, fmt.Errorf("pkcs7: malformed encrypted content: %v", err)
 			}
+			buf.Write(part)
+			cypherbytes = rest
 		}
 		cyphertext = buf.Bytes()
 	} else {
@@ -193,6 +194,9 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	if len(iv) != block.BlockSize() {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
 	}
+	if len(cyphertext) == 0 || len(cyphertext)%block.BlockSize() != 0 {
+		return nil, errors.New("pkcs7: invalid ciphertext length")
+	}
 	mode := cipher.NewCBCDecrypter(block, iv)
 	plaintext := make([]byte, len(cyphertext))
 	mode.CryptBlocks(plaintext, cyphertext)
@@ -212,6 +216,9 @@ func unpad(data []byte, blocklen int) ([]byte, error) {
 
 	// the last byte is the length of padding
 	padlen := int(data[len(data)-1])
+	if padlen == 0 || padlen > blocklen {
+		return nil, errors.New("invalid padding")
+	}
 
 	// check padding integrity, all bytes should be the same
 	pad := data[len(data)-padlen:]
