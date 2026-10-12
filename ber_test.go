@@ -94,6 +94,34 @@ func TestParseMalformedBERNoPanic(t *testing.T) {
 	}
 }
 
+func TestBer2DerOversizedLengthNoAlloc(t *testing.T) {
+	// A declared length beyond the remaining input must be rejected before the
+	// content buffer is allocated, for both primitive and constructed values.
+	fixtures := []struct {
+		name  string
+		input []byte
+	}{
+		{"constructed, 256 MB", []byte{0x30, 0x84, 0x10, 0x00, 0x00, 0x00}},
+		{"constructed, 2 GB", []byte{0x30, 0x84, 0x7F, 0xFF, 0xFF, 0xFF}},
+		{"primitive, 256 MB", []byte{0x04, 0x84, 0x10, 0x00, 0x00, 0x00}},
+		{"primitive, 2 GB", []byte{0x04, 0x84, 0x7F, 0xFF, 0xFF, 0xFF}},
+	}
+	const limit = 1 << 20
+	for _, f := range fixtures {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, err := ber2der(f.input)
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Errorf("%s: expected error, got nil", f.name)
+		}
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > limit {
+			t.Errorf("%s: allocated %d bytes, want at most %d", f.name, alloc, limit)
+		}
+	}
+}
+
 func TestBer2DerValidUnchanged(t *testing.T) {
 	// Well-formed BER and DER must transcode to the expected DER; DER input
 	// must pass through byte for byte.
