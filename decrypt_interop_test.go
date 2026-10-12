@@ -105,8 +105,8 @@ func TestDecryptWrongRecipient(t *testing.T) {
 		t.Fatal(err)
 	}
 	cert, key := loadTestIdentity(t, "other")
-	if _, err := p7.Decrypt(cert, key); err == nil {
-		t.Fatal("expected an error for a non-recipient certificate")
+	if _, err := p7.Decrypt(cert, key); !errors.Is(err, ErrNoRecipient) {
+		t.Fatalf("expected ErrNoRecipient for a non-recipient certificate, got %v", err)
 	}
 }
 
@@ -165,6 +165,35 @@ func TestEncryptWithAlgorithm(t *testing.T) {
 
 	if _, err := EncryptWithAlgorithm(plaintext, []*x509.Certificate{cert}, 999); !errors.Is(err, ErrUnsupportedEncryptionAlgorithm) {
 		t.Errorf("unknown algorithm: got %v, want ErrUnsupportedEncryptionAlgorithm", err)
+	}
+}
+
+// TestEncryptRecipientKeyAlgorithmParameters checks that the rsaEncryption
+// AlgorithmIdentifier in each RecipientInfo carries the explicit NULL
+// parameter required by RFC 3370 4.2.1, as OpenSSL writes it.
+func TestEncryptRecipientKeyAlgorithmParameters(t *testing.T) {
+	cert, _ := loadTestIdentity(t, "recipient")
+	der, err := EncryptWithAlgorithm([]byte("x"), []*x509.Certificate{cert}, EncryptionAlgorithmAES128CBC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ci contentInfo
+	if _, err := asn1.Unmarshal(der, &ci); err != nil {
+		t.Fatal(err)
+	}
+	var ed envelopedData
+	if _, err := asn1.Unmarshal(ci.Content.Bytes, &ed); err != nil {
+		t.Fatal(err)
+	}
+	if len(ed.RecipientInfos) != 1 {
+		t.Fatalf("got %d recipients, want 1", len(ed.RecipientInfos))
+	}
+	alg := ed.RecipientInfos[0].KeyEncryptionAlgorithm
+	if !alg.Algorithm.Equal(OIDEncryptionAlgorithmRSA) {
+		t.Errorf("key encryption algorithm = %v, want rsaEncryption", alg.Algorithm)
+	}
+	if !bytes.Equal(alg.Parameters.FullBytes, []byte{0x05, 0x00}) {
+		t.Errorf("rsaEncryption parameters = % X, want NULL (05 00)", alg.Parameters.FullBytes)
 	}
 }
 

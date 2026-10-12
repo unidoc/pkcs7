@@ -61,7 +61,7 @@ func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
 func ber2der(data []byte) ([]byte, error) {
 	out := new(bytes.Buffer)
 
-	obj, err := readObject(bytes.NewReader(data))
+	obj, err := readObject(bytes.NewReader(data), 0)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -131,7 +131,14 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 	return
 }
 
-func readObject(r *bytes.Reader) (obj asn1Object, err error) {
+// maxBERNesting limits how deeply constructed values may nest. Real CMS
+// structures stay well below it. The limit keeps hostile input from
+// overflowing the stack and bounds the content copied per nesting level.
+const maxBERNesting = 64
+
+// readObject reads one BER value from r. depth is the number of constructed
+// values enclosing it.
+func readObject(r *bytes.Reader, depth int) (obj asn1Object, err error) {
 	var tagB byte
 	if tagB, err = r.ReadByte(); err != nil {
 		return
@@ -144,7 +151,17 @@ func readObject(r *bytes.Reader) (obj asn1Object, err error) {
 		return nil, fmt.Errorf("end of ber data reached")
 	}
 	length := (int)(l & 0x7F)
-	if l > 0x80 {
+	// A definite length of zero (0x00) is an empty value, not the indefinite
+	// form (0x80).
+	indefinite := false
+	if l == 0x80 {
+		if primitive {
+			// X.690 8.1.3.2: the indefinite form is only allowed for
+			// constructed encodings.
+			return nil, errors.New("ber2der: indefinite length on primitive tag")
+		}
+		indefinite = true
+	} else if l > 0x80 {
 		numberOfBytes := length
 		length = 0
 		if numberOfBytes > 4 { // int is only guaranteed to be 32bit
@@ -168,60 +185,65 @@ func readObject(r *bytes.Reader) (obj asn1Object, err error) {
 	}
 
 	if primitive {
+		// Check the declared length against the remaining input before
+		// allocating, so a hostile length cannot force a large allocation.
+		if length > r.Len() {
+			return nil, fmt.Errorf("Invalid BER format")
+		}
 		p := asn1Primitive{
 			tagBytes: []byte{tagB},
 			length:   length,
 			content:  make([]byte, length),
 		}
 		if length > 0 {
-			_, err = r.Read(p.content)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("Invalid BER format")
+			if _, err = io.ReadFull(r, p.content); err != nil {
+				return nil, fmt.Errorf("Invalid BER format")
+			}
 		}
 		obj = p
 		return
-	} else {
-		subObjects := make([]asn1Object, 0)
-		var sobj asn1Object
-		if length > 0 {
-			content := make([]byte, length)
-			n, err := r.Read(content)
-			if err != nil {
-				return nil, err
-			}
-			if n != length {
-				return nil, fmt.Errorf("length is more than available data")
-			}
-			r = bytes.NewReader(content)
-		}
-		for {
-			sobj, err = readObject(r)
-			if err != nil && err != io.EOF {
-				return
-			}
-			if err == io.EOF && length >= 0 {
-				err = nil
-				break
-			}
-			if sobj == nil {
-				break
-			}
-			if po, ok := sobj.(asn1Primitive); ok {
-				if po.length == 0 && po.tagBytes[0] == 0 && length == 0 {
-					break
-				}
-			}
-			subObjects = append(subObjects, sobj)
-
-			if err != nil {
-				break
-			}
-		}
-		obj = asn1Structured{
-			tagBytes: []byte{tagB},
-			content:  subObjects,
-		}
-		return
 	}
+
+	if depth >= maxBERNesting {
+		return nil, errors.New("ber2der: BER nesting too deep")
+	}
+	subObjects := make([]asn1Object, 0)
+	if !indefinite {
+		if length > r.Len() {
+			return nil, fmt.Errorf("length is more than available data")
+		}
+		content := make([]byte, length)
+		if _, err = io.ReadFull(r, content); err != nil {
+			return nil, fmt.Errorf("length is more than available data")
+		}
+		r = bytes.NewReader(content)
+	}
+	for {
+		if !indefinite && r.Len() == 0 {
+			// Definite length: the content has been consumed exactly.
+			break
+		}
+		var sobj asn1Object
+		sobj, err = readObject(r, depth+1)
+		if err != nil {
+			if err == io.EOF {
+				// Only the indefinite form can reach here: the input ended
+				// before the end-of-contents octets.
+				return nil, errors.New("ber2der: missing end-of-contents octets")
+			}
+			return nil, err
+		}
+		if indefinite {
+			if po, ok := sobj.(asn1Primitive); ok && po.length == 0 && po.tagBytes[0] == 0 {
+				// End-of-contents (00 00) terminates the indefinite value.
+				break
+			}
+		}
+		subObjects = append(subObjects, sobj)
+	}
+	obj = asn1Structured{
+		tagBytes: []byte{tagB},
+		content:  subObjects,
+	}
+	return
 }

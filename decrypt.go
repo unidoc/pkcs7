@@ -23,6 +23,10 @@ var ErrUnsupportedAlgorithm = errors.New("pkcs7: cannot decrypt data: only RSA k
 // ErrNotEncryptedContent is returned when attempting to Decrypt data that is not encrypted data
 var ErrNotEncryptedContent = errors.New("pkcs7: content data is a decryptable data type")
 
+// ErrNoRecipient is returned by Decrypt when none of the enveloped
+// recipients matches the provided certificate.
+var ErrNoRecipient = errors.New("pkcs7: no enveloped recipient for provided certificate")
+
 // Decrypt decrypts encrypted content info for recipient cert and private key
 func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte, error) {
 	data, ok := p7.raw.(envelopedData)
@@ -31,7 +35,7 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 	}
 	recipient := selectRecipientForCertificate(data.RecipientInfos, cert)
 	if recipient.EncryptedKey == nil {
-		return nil, errors.New("pkcs7: no enveloped recipient for provided certificate")
+		return nil, ErrNoRecipient
 	}
 	switch pkey.(type) {
 	case *rsa.PrivateKey:
