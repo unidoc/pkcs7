@@ -251,7 +251,9 @@ func rc2Envelope(t *testing.T, cert *x509.Certificate, key []byte, effectiveBits
 
 // TestDecryptRC2KeyLengths checks the RC2 key lengths Decrypt accepts: the
 // effective key length, and 16 bytes with a shorter effective length as some
-// S/MIME clients transport it. Other lengths do not decrypt.
+// S/MIME clients transport it. Other lengths do not decrypt; with CBC content
+// the fallback key passes the padding check for about 1 key in 256, so the
+// rejected case is checked by its plaintext, not by an error.
 func TestDecryptRC2KeyLengths(t *testing.T) {
 	cert, key := loadTestIdentity(t, "recipient")
 	plaintext := []byte("rc2 key length")
@@ -277,8 +279,8 @@ func TestDecryptRC2KeyLengths(t *testing.T) {
 			p7 := rc2Envelope(t, cert, randomBytes(t, c.keyLen), c.bits, c.params, plaintext)
 			got, err := p7.Decrypt(cert, key)
 			if !c.ok {
-				if err == nil {
-					t.Error("expected an error")
+				if err == nil && bytes.Equal(got, plaintext) {
+					t.Error("decrypted with an unsupported key length")
 				}
 				return
 			}
@@ -289,6 +291,39 @@ func TestDecryptRC2KeyLengths(t *testing.T) {
 				t.Errorf("Decrypt: got %q", got)
 			}
 		})
+	}
+}
+
+// TestDecryptRC2PrefersTransportedKey checks that when an RC2 envelope carries
+// a 16-byte key with a shorter effective length, Decrypt uses that key and not
+// the fallback for the effective length, even when content encrypted under
+// that fallback would pass the padding check.
+func TestDecryptRC2PrefersTransportedKey(t *testing.T) {
+	cert, key := loadTestIdentity(t, "recipient")
+	priv := key.(*rsa.PrivateKey)
+	decoy := []byte("decrypted with the fallback key")
+	v40, _ := asn1.Marshal(rc2CBCParameters{Version: 160, IV: make([]byte, 8)})
+
+	ek, err := rsa.EncryptPKCS1v15(rand.Reader, &priv.PublicKey, randomBytes(t, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := canonicalCiphertext(priv, ek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Content that opens cleanly under the 5-byte fallback key.
+	eci := rc2EncryptedContent(t, implicitRejectionKey(priv, canonical, 5), 40, v40, decoy)
+	ias, err := cert2issuerAndSerial(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7 := &PKCS7{raw: envelopedData{
+		RecipientInfos:       []recipientInfo{{IssuerAndSerialNumber: ias, EncryptedKey: ek}},
+		EncryptedContentInfo: eci,
+	}}
+	if got, err := p7.Decrypt(cert, key); err == nil && bytes.Equal(got, decoy) {
+		t.Error("Decrypt used the fallback key instead of the transported 16-byte key")
 	}
 }
 

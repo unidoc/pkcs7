@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
@@ -62,20 +63,23 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 		if err != nil {
 			return nil, err
 		}
-		for _, n := range lengths {
-			contentKey := implicitRejectionKey(priv, ciphertext, n)
+		// The RSA plaintext has one length, so at most one candidate is
+		// replaced by the real key. Pick that one, or the first fallback when
+		// none is, without branching on which, and decrypt the content once.
+		keys := make([][]byte, len(lengths))
+		idx := 0
+		for i, n := range lengths {
+			fallback := implicitRejectionKey(priv, ciphertext, n)
+			keys[i] = append([]byte(nil), fallback...)
 			// Only ciphertext and key size problems are reported here, and
 			// those are public.
-			if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, priv, ciphertext, contentKey); err != nil {
+			if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, priv, ciphertext, keys[i]); err != nil {
 				return nil, err
 			}
-			plaintext, perr := data.EncryptedContentInfo.decrypt(contentKey)
-			if perr == nil {
-				return plaintext, nil
-			}
-			err = perr
+			replaced := 1 - subtle.ConstantTimeCompare(keys[i], fallback)
+			idx = subtle.ConstantTimeSelect(replaced, i, idx)
 		}
-		return nil, err
+		return data.EncryptedContentInfo.decrypt(keys[idx])
 	}
 	return nil, ErrUnsupportedAlgorithm
 }
@@ -114,8 +118,8 @@ func implicitRejectionKey(priv *rsa.PrivateKey, ciphertext []byte, n int) []byte
 	return key[:n]
 }
 
-// contentKeyLengths returns the content-encryption key lengths in bytes to try
-// for the algorithm in eci, most likely first.
+// contentKeyLengths returns the content-encryption key lengths in bytes that
+// the algorithm in eci accepts. The first is used when the padding is invalid.
 func (eci encryptedContentInfo) contentKeyLengths() ([]int, error) {
 	alg := eci.ContentEncryptionAlgorithm.Algorithm
 	switch {
@@ -130,7 +134,7 @@ func (eci encryptedContentInfo) contentKeyLengths() ([]int, error) {
 	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
 		// The RC2 key length is not encoded. Producers use the effective key
 		// length, but some S/MIME clients transport a 16-byte key with a
-		// shorter effective length, so both are tried.
+		// shorter effective length, so both are accepted.
 		_, bits, err := rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
 		if err != nil {
 			return nil, err
