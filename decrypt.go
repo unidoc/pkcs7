@@ -6,8 +6,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/des"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
@@ -37,16 +39,79 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 	if recipient.EncryptedKey == nil {
 		return nil, ErrNoRecipient
 	}
-	switch pkey.(type) {
+	switch priv := pkey.(type) {
 	case *rsa.PrivateKey:
-		var contentKey []byte
-		contentKey, err := rsa.DecryptPKCS1v15(rand.Reader, pkey.(*rsa.PrivateKey), recipient.EncryptedKey)
+		// Implicit rejection (Bleichenbacher): DecryptPKCS1v15SessionKey
+		// replaces the fallback key only when the PKCS#1 v1.5 padding is
+		// valid, and content decryption runs either way, so neither the error
+		// nor the timing reveals whether the padding was valid. The fallback
+		// is deterministic, so repeating a query does not reveal it either.
+		if priv.N == nil || priv.D == nil {
+			return nil, errors.New("pkcs7: incomplete RSA private key")
+		}
+		keyLen, err := data.EncryptedContentInfo.contentKeyLength()
 		if err != nil {
+			return nil, err
+		}
+		contentKey := implicitRejectionKey(priv, recipient.EncryptedKey, keyLen)
+		// Only ciphertext and key size problems are reported here, and
+		// those are public.
+		if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, priv, recipient.EncryptedKey, contentKey); err != nil {
 			return nil, err
 		}
 		return data.EncryptedContentInfo.decrypt(contentKey)
 	}
 	return nil, ErrUnsupportedAlgorithm
+}
+
+// implicitRejectionKey returns an n-byte fallback key: HMAC-SHA256, keyed by a
+// hash of the private exponent, over n and the ciphertext. It is deterministic
+// and unpredictable without the private key.
+//
+// The ciphertext is left-padded to the modulus length because crypto/rsa
+// accepts shorter encodings of the same integer. n is included so that keys of
+// different lengths are not prefixes of each other.
+func implicitRejectionKey(priv *rsa.PrivateKey, ciphertext []byte, n int) []byte {
+	if k := priv.Size(); len(ciphertext) < k {
+		padded := make([]byte, k)
+		copy(padded[k-len(ciphertext):], ciphertext)
+		ciphertext = padded
+	}
+	kdk := sha256.Sum256(priv.D.Bytes())
+	mac := hmac.New(sha256.New, kdk[:])
+	key := make([]byte, 0, n+sha256.Size)
+	for i := 0; len(key) < n; i++ {
+		mac.Reset()
+		mac.Write([]byte{byte(n >> 8), byte(n), byte(i >> 8), byte(i)})
+		mac.Write(ciphertext)
+		key = mac.Sum(key)
+	}
+	return key[:n]
+}
+
+// contentKeyLength returns the length in bytes of the content-encryption key
+// that the algorithm in eci requires.
+func (eci encryptedContentInfo) contentKeyLength() (int, error) {
+	alg := eci.ContentEncryptionAlgorithm.Algorithm
+	switch {
+	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
+		return 8, nil
+	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
+		return 24, nil
+	case alg.Equal(OIDEncryptionAlgorithmAES128CBC), alg.Equal(OIDEncryptionAlgorithmAES128GCM):
+		return 16, nil
+	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
+		return 32, nil
+	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
+		// The RC2 key length is not encoded; take it to be the effective key
+		// length, as producers write it. Other lengths do not decrypt.
+		_, bits, err := rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
+		if err != nil {
+			return 0, err
+		}
+		return (bits + 7) / 8, nil
+	}
+	return 0, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg)
 }
 
 // DecryptUsingPSK decrypts encrypted data using caller provided

@@ -282,7 +282,7 @@ func rc2EncryptedContent(t *testing.T, key []byte, effectiveBits int, params []b
 // RC2-CBCParameter (RFC 2268 §6): a bare 8-byte IV, meaning 32 effective
 // key bits. The SEQUENCE form always carries a version.
 func TestDecryptRC2BareIVParameters(t *testing.T) {
-	key := []byte("0123456789abcdef")
+	key := []byte("0123")
 	ivParam, _ := asn1.Marshal(make([]byte, 8))
 	eci := rc2EncryptedContent(t, key, 32, ivParam, []byte("bare iv"))
 	got, err := eci.decrypt(key)
