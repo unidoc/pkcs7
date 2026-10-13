@@ -375,6 +375,9 @@ func EncryptWithAlgorithm(content []byte, recipients []*x509.Certificate, alg in
 			IssuerAndSerialNumber: ias,
 			KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{
 				Algorithm: OIDEncryptionAlgorithmRSA,
+				// RFC 3370 4.2.1 / RFC 8017 A.1: rsaEncryption carries an
+				// explicit NULL parameter.
+				Parameters: asn1.NullRawValue,
 			},
 			EncryptedKey: encrypted,
 		}
