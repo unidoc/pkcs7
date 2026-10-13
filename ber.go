@@ -140,8 +140,8 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 const maxBERNesting = 64
 
 // isEndOfContents reports whether obj is the end-of-contents octets (00 00).
-// Tag 0 has no other use (X.690 8.1.5), so outside an indefinite-length value
-// they are an error.
+// readObject rejects tag 0 with content, so this is the only tag-0 value that
+// can reach it. Outside an indefinite-length value it is an error.
 func isEndOfContents(obj asn1Object) bool {
 	po, ok := obj.(asn1Primitive)
 	return ok && po.length == 0 && po.tagBytes[0] == 0
@@ -193,6 +193,11 @@ func readObject(r *bytes.Reader, depth int) (obj asn1Object, err error) {
 			}
 			length = length*256 + (int)(sl)
 		}
+	}
+
+	if tagB == 0 && length != 0 {
+		// Tag 0 is only valid as the end-of-contents octets (X.690 8.1.5).
+		return nil, errors.New("ber2der: tag 0 with content")
 	}
 
 	if primitive {

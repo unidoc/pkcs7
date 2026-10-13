@@ -85,6 +85,8 @@ func TestParseMalformedBERNoPanic(t *testing.T) {
 		{"empty constructed value followed by truncated sibling", []byte{0x30, 0x05, 0x30, 0x00, 0x02, 0x01}},
 		{"end-of-contents inside a definite-length value", []byte{0x30, 0x02, 0x00, 0x00}},
 		{"end-of-contents at top level", []byte{0x00, 0x00}},
+		{"tag 0 with content", []byte{0x00, 0x01, 0xAA}},
+		{"tag 0 with content inside a sequence", []byte{0x30, 0x03, 0x00, 0x01, 0xAA}},
 	}
 	for _, f := range fixtures {
 		if _, err := ber2der(f.input); err == nil {
