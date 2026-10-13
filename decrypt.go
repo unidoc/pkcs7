@@ -29,7 +29,12 @@ var ErrNotEncryptedContent = errors.New("pkcs7: content data is a decryptable da
 // recipients matches the provided certificate.
 var ErrNoRecipient = errors.New("pkcs7: no enveloped recipient for provided certificate")
 
-// Decrypt decrypts encrypted content info for recipient cert and private key
+// Decrypt decrypts encrypted content info for recipient cert and private key.
+//
+// A wrong private key, or a tampered encrypted key, fails like a wrong content
+// key. Content in an unauthenticated mode (CBC) then decrypts to garbage with
+// no error for about one such key in 256, so callers that cannot rule out a
+// mismatch should validate the plaintext.
 func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte, error) {
 	data, ok := p7.raw.(envelopedData)
 	if !ok {
@@ -49,34 +54,54 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 		if priv.N == nil || priv.D == nil {
 			return nil, errors.New("pkcs7: incomplete RSA private key")
 		}
-		keyLen, err := data.EncryptedContentInfo.contentKeyLength()
+		ciphertext, err := canonicalCiphertext(priv, recipient.EncryptedKey)
 		if err != nil {
 			return nil, err
 		}
-		contentKey := implicitRejectionKey(priv, recipient.EncryptedKey, keyLen)
-		// Only ciphertext and key size problems are reported here, and
-		// those are public.
-		if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, priv, recipient.EncryptedKey, contentKey); err != nil {
+		lengths, err := data.EncryptedContentInfo.contentKeyLengths()
+		if err != nil {
 			return nil, err
 		}
-		return data.EncryptedContentInfo.decrypt(contentKey)
+		for _, n := range lengths {
+			contentKey := implicitRejectionKey(priv, ciphertext, n)
+			// Only ciphertext and key size problems are reported here, and
+			// those are public.
+			if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, priv, ciphertext, contentKey); err != nil {
+				return nil, err
+			}
+			plaintext, perr := data.EncryptedContentInfo.decrypt(contentKey)
+			if perr == nil {
+				return plaintext, nil
+			}
+			err = perr
+		}
+		return nil, err
 	}
 	return nil, ErrUnsupportedAlgorithm
 }
 
+// canonicalCiphertext returns ciphertext as exactly priv.Size() bytes.
+// crypto/rsa accepts shorter encodings of the same integer, and longer ones
+// with leading zero bytes for some modulus sizes, so one integer must map to
+// one byte string before it is used to derive the fallback key.
+func canonicalCiphertext(priv *rsa.PrivateKey, ciphertext []byte) ([]byte, error) {
+	k := priv.Size()
+	for len(ciphertext) > 0 && ciphertext[0] == 0 {
+		ciphertext = ciphertext[1:]
+	}
+	if len(ciphertext) > k {
+		return nil, errors.New("pkcs7: encrypted key is longer than the RSA modulus")
+	}
+	out := make([]byte, k)
+	copy(out[k-len(ciphertext):], ciphertext)
+	return out, nil
+}
+
 // implicitRejectionKey returns an n-byte fallback key: HMAC-SHA256, keyed by a
 // hash of the private exponent, over n and the ciphertext. It is deterministic
-// and unpredictable without the private key.
-//
-// The ciphertext is left-padded to the modulus length because crypto/rsa
-// accepts shorter encodings of the same integer. n is included so that keys of
+// and unpredictable without the private key. n is included so that keys of
 // different lengths are not prefixes of each other.
 func implicitRejectionKey(priv *rsa.PrivateKey, ciphertext []byte, n int) []byte {
-	if k := priv.Size(); len(ciphertext) < k {
-		padded := make([]byte, k)
-		copy(padded[k-len(ciphertext):], ciphertext)
-		ciphertext = padded
-	}
 	kdk := sha256.Sum256(priv.D.Bytes())
 	mac := hmac.New(sha256.New, kdk[:])
 	key := make([]byte, 0, n+sha256.Size)
@@ -89,29 +114,33 @@ func implicitRejectionKey(priv *rsa.PrivateKey, ciphertext []byte, n int) []byte
 	return key[:n]
 }
 
-// contentKeyLength returns the length in bytes of the content-encryption key
-// that the algorithm in eci requires.
-func (eci encryptedContentInfo) contentKeyLength() (int, error) {
+// contentKeyLengths returns the content-encryption key lengths in bytes to try
+// for the algorithm in eci, most likely first.
+func (eci encryptedContentInfo) contentKeyLengths() ([]int, error) {
 	alg := eci.ContentEncryptionAlgorithm.Algorithm
 	switch {
 	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
-		return 8, nil
+		return []int{8}, nil
 	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
-		return 24, nil
+		return []int{24}, nil
 	case alg.Equal(OIDEncryptionAlgorithmAES128CBC), alg.Equal(OIDEncryptionAlgorithmAES128GCM):
-		return 16, nil
+		return []int{16}, nil
 	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
-		return 32, nil
+		return []int{32}, nil
 	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
-		// The RC2 key length is not encoded; take it to be the effective key
-		// length, as producers write it. Other lengths do not decrypt.
+		// The RC2 key length is not encoded. Producers use the effective key
+		// length, but some S/MIME clients transport a 16-byte key with a
+		// shorter effective length, so both are tried.
 		_, bits, err := rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		return (bits + 7) / 8, nil
+		if n := (bits + 7) / 8; n != 16 {
+			return []int{n, 16}, nil
+		}
+		return []int{16}, nil
 	}
-	return 0, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg)
+	return nil, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg)
 }
 
 // DecryptUsingPSK decrypts encrypted data using caller provided

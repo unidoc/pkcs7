@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
 	"math/big"
 	"testing"
 )
@@ -68,10 +69,11 @@ func TestDecryptImplicitRejection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			keyLen, err := p7.raw.(envelopedData).EncryptedContentInfo.contentKeyLength()
+			lengths, err := p7.raw.(envelopedData).EncryptedContentInfo.contentKeyLengths()
 			if err != nil {
 				t.Fatal(err)
 			}
+			keyLen := lengths[0]
 			encrypt := func(k []byte) []byte {
 				ek, err := rsa.EncryptPKCS1v15(rand.Reader, pub, k)
 				if err != nil {
@@ -152,10 +154,11 @@ func TestDecryptBadPaddingKeyIsDeterministic(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			keyLen, err := probe.contentKeyLength()
+			lengths, err := probe.contentKeyLengths()
 			if err != nil {
 				t.Fatal(err)
 			}
+			keyLen := lengths[0]
 			eci, err := enc(implicitRejectionKey(priv, ek, keyLen))
 			if err != nil {
 				t.Fatal(err)
@@ -175,11 +178,13 @@ func TestDecryptBadPaddingKeyIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestDecryptShortEncodingSameFallback checks that a bad-padding EncryptedKey
-// with its leading zero byte stripped gets the same fallback key as the full
-// encoding. crypto/rsa decrypts both encodings to the same real key, so
-// different fallback keys would tell bad padding apart from valid padding.
-func TestDecryptShortEncodingSameFallback(t *testing.T) {
+// TestDecryptCiphertextEncodings checks that every encoding of a bad-padding
+// EncryptedKey, with its leading zero byte stripped or with extra leading zero
+// bytes, gets the same fallback key as the modulus-length encoding. crypto/rsa
+// decrypts them to the same real key, so different fallback keys would tell
+// bad padding apart from valid padding. A longer encoding that is not just
+// leading zeros is rejected.
+func TestDecryptCiphertextEncodings(t *testing.T) {
 	cert, key := loadTestIdentity(t, "recipient")
 	priv := key.(*rsa.PrivateKey)
 	var ek []byte
@@ -200,17 +205,90 @@ func TestDecryptShortEncodingSameFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, e := range map[string][]byte{"full": ek, "leading zero stripped": ek[1:]} {
-		p7 := &PKCS7{raw: envelopedData{
+	envelope := func(e []byte) *PKCS7 {
+		return &PKCS7{raw: envelopedData{
 			RecipientInfos:       []recipientInfo{{IssuerAndSerialNumber: ias, EncryptedKey: e}},
 			EncryptedContentInfo: *eci,
 		}}
-		got, err := p7.Decrypt(cert, key)
+	}
+	for name, e := range map[string][]byte{
+		"modulus length":         ek,
+		"leading zero stripped":  ek[1:],
+		"one extra zero byte":    append([]byte{0}, ek...),
+		"eight extra zero bytes": append(make([]byte, 8), ek...),
+	} {
+		got, err := envelope(e).Decrypt(cert, key)
 		if err != nil {
 			t.Errorf("%s: Decrypt: %v", name, err)
 		} else if !bytes.Equal(got, plaintext) {
 			t.Errorf("%s: Decrypt: got %q", name, got)
 		}
+	}
+	if _, err := envelope(append([]byte{1}, ek...)).Decrypt(cert, key); err == nil {
+		t.Error("encoding longer than the modulus: expected an error")
+	}
+}
+
+// rc2Envelope wraps key for cert and returns an EnvelopedData whose RC2-CBC
+// content was encrypted with key under the given effective key length and
+// parameters.
+func rc2Envelope(t *testing.T, cert *x509.Certificate, key []byte, effectiveBits int, params []byte, plaintext []byte) *PKCS7 {
+	t.Helper()
+	eci := rc2EncryptedContent(t, key, effectiveBits, params, plaintext)
+	ek, err := rsa.EncryptPKCS1v15(rand.Reader, cert.PublicKey.(*rsa.PublicKey), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ias, err := cert2issuerAndSerial(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &PKCS7{raw: envelopedData{
+		RecipientInfos:       []recipientInfo{{IssuerAndSerialNumber: ias, EncryptedKey: ek}},
+		EncryptedContentInfo: eci,
+	}}
+}
+
+// TestDecryptRC2KeyLengths checks the RC2 key lengths Decrypt accepts: the
+// effective key length, and 16 bytes with a shorter effective length as some
+// S/MIME clients transport it. Other lengths do not decrypt.
+func TestDecryptRC2KeyLengths(t *testing.T) {
+	cert, key := loadTestIdentity(t, "recipient")
+	plaintext := []byte("rc2 key length")
+	bareIV, _ := asn1.Marshal(make([]byte, 8))
+	v40, _ := asn1.Marshal(rc2CBCParameters{Version: 160, IV: make([]byte, 8)})
+	v128, _ := asn1.Marshal(rc2CBCParameters{Version: rc2Version128, IV: make([]byte, 8)})
+
+	for _, c := range []struct {
+		name   string
+		keyLen int
+		bits   int
+		params []byte
+		ok     bool
+	}{
+		{"128 bits, 16-byte key", 16, 128, v128, true},
+		{"40 bits, 5-byte key", 5, 40, v40, true},
+		{"40 bits, 16-byte key", 16, 40, v40, true},
+		{"bare IV (32 bits), 4-byte key", 4, 32, bareIV, true},
+		{"bare IV (32 bits), 16-byte key", 16, 32, bareIV, true},
+		{"40 bits, 8-byte key", 8, 40, v40, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p7 := rc2Envelope(t, cert, randomBytes(t, c.keyLen), c.bits, c.params, plaintext)
+			got, err := p7.Decrypt(cert, key)
+			if !c.ok {
+				if err == nil {
+					t.Error("expected an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Decrypt: %v", err)
+			}
+			if !bytes.Equal(got, plaintext) {
+				t.Errorf("Decrypt: got %q", got)
+			}
+		})
 	}
 }
 
@@ -264,10 +342,27 @@ func TestImplicitRejectionKey(t *testing.T) {
 		}
 	}
 
-	// Every encoding of one integer gets one key.
-	c3 := randomBytes(t, priv.Size())
-	c3[0] = 0
-	if !bytes.Equal(implicitRejectionKey(priv, c3, 16), implicitRejectionKey(priv, c3[1:], 16)) {
-		t.Error("leading-zero and stripped encodings give different keys")
+}
+
+func TestCanonicalCiphertext(t *testing.T) {
+	_, key := loadTestIdentity(t, "recipient")
+	priv := key.(*rsa.PrivateKey)
+	k := priv.Size()
+	c := randomBytes(t, k)
+	c[0] = 0
+	for name, in := range map[string][]byte{
+		"modulus length": c,
+		"stripped":       c[1:],
+		"extra zeros":    append(make([]byte, 3), c...),
+	} {
+		got, err := canonicalCiphertext(priv, in)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		} else if !bytes.Equal(got, c) {
+			t.Errorf("%s: not canonical", name)
+		}
+	}
+	if _, err := canonicalCiphertext(priv, append([]byte{1}, c...)); err == nil {
+		t.Error("longer than the modulus: expected an error")
 	}
 }
