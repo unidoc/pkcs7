@@ -72,8 +72,8 @@ func TestParseMalformedBERNoPanic(t *testing.T) {
 		name  string
 		input []byte
 	}{
-		{"indefinite length on primitive tag", []byte{0x1F, 0x80}},
-		{"primitive length past end of input", []byte{0x1F, 0x05}},
+		{"indefinite length on primitive tag", []byte{0x04, 0x80}},
+		{"primitive length past end of input", []byte{0x04, 0x05}},
 		{"long-form length with no length octets", []byte{0x30, 0x81}},
 		{"long-form length truncated", []byte{0x30, 0x84, 0x01}},
 		{"truncated primitive content", []byte{0x04, 0x05, 0x01, 0x02}},
@@ -83,6 +83,8 @@ func TestParseMalformedBERNoPanic(t *testing.T) {
 		{"indefinite length with no content at all", []byte{0x30, 0x80}},
 		{"indefinite primitive nested in indefinite constructed", []byte{0x30, 0x80, 0x04, 0x80, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00}},
 		{"empty constructed value followed by truncated sibling", []byte{0x30, 0x05, 0x30, 0x00, 0x02, 0x01}},
+		{"end-of-contents inside a definite-length value", []byte{0x30, 0x02, 0x00, 0x00}},
+		{"end-of-contents at top level", []byte{0x00, 0x00}},
 	}
 	for _, f := range fixtures {
 		if _, err := ber2der(f.input); err == nil {

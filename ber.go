@@ -62,11 +62,14 @@ func ber2der(data []byte) ([]byte, error) {
 	out := new(bytes.Buffer)
 
 	obj, err := readObject(bytes.NewReader(data), 0)
-	if err != nil && err != io.EOF {
+	if err != nil {
 		return nil, err
 	}
 	if obj == nil {
 		return nil, fmt.Errorf("error to parse BER")
+	}
+	if isEndOfContents(obj) {
+		return nil, errors.New("ber2der: unexpected end-of-contents octets")
 	}
 	obj.EncodeTo(out)
 
@@ -135,6 +138,14 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 // structures stay well below it. The limit keeps hostile input from
 // overflowing the stack and bounds the content copied per nesting level.
 const maxBERNesting = 64
+
+// isEndOfContents reports whether obj is the end-of-contents octets (00 00).
+// Tag 0 has no other use (X.690 8.1.5), so outside an indefinite-length value
+// they are an error.
+func isEndOfContents(obj asn1Object) bool {
+	po, ok := obj.(asn1Primitive)
+	return ok && po.length == 0 && po.tagBytes[0] == 0
+}
 
 // readObject reads one BER value from r. depth is the number of constructed
 // values enclosing it.
@@ -233,11 +244,12 @@ func readObject(r *bytes.Reader, depth int) (obj asn1Object, err error) {
 			}
 			return nil, err
 		}
-		if indefinite {
-			if po, ok := sobj.(asn1Primitive); ok && po.length == 0 && po.tagBytes[0] == 0 {
-				// End-of-contents (00 00) terminates the indefinite value.
-				break
+		if isEndOfContents(sobj) {
+			if !indefinite {
+				return nil, errors.New("ber2der: unexpected end-of-contents octets")
 			}
+			// End-of-contents (00 00) terminates the indefinite value.
+			break
 		}
 		subObjects = append(subObjects, sobj)
 	}
