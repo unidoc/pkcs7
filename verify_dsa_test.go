@@ -3,23 +3,18 @@ package pkcs7
 import (
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
-	"io/ioutil"
-	"os"
-	"os/exec"
 	"testing"
 )
 
-func TestVerifyEC2(t *testing.T) {
-	t.Skip("crypto/x509 does not verify DSA signatures since Go 1.16")
+func TestVerifyEC2RejectsDSA(t *testing.T) {
 	fixture := UnmarshalDSATestFixture(EC2IdentityDocumentFixture)
 	p7, err := Parse(fixture.Input)
 	if err != nil {
-		t.Errorf("Parse encountered unexpected error: %v", err)
+		t.Fatalf("Parse encountered unexpected error: %v", err)
 	}
 	p7.Certificates = []*x509.Certificate{fixture.Certificate}
-	if err := p7.Verify(); err != nil {
-		t.Errorf("Verify failed with error: %v", err)
+	if err := p7.Verify(); err != x509.ErrUnsupportedAlgorithm {
+		t.Fatalf("Verify of a DSA signature returned %v, want x509.ErrUnsupportedAlgorithm", err)
 	}
 }
 
@@ -61,79 +56,6 @@ MXrs3IgIb6+hUIB+S8dz8/mmO0bpr76RoZVCXYab2CZedFut7qc3WUH9+EUAH5mw
 vSeDCOUMYQR7R9LINYwouHIziqQYMAkGByqGSM44BAMDLwAwLAIUWXBlk40xTwSw
 7HX32MxXYruse9ACFBNGmdX2ZBrVNGrN9N2f6ROk0k9K
 -----END CERTIFICATE-----`
-
-func TestDSASignWithOpenSSLAndVerify(t *testing.T) {
-	t.Skip("crypto/x509 does not verify DSA signatures since Go 1.16")
-	content := []byte(`
-A ship in port is safe,
-but that's not what ships are built for.
--- Grace Hopper`)
-	// write the content to a temp file
-	tmpContentFile, err := ioutil.TempFile("", "TestDSASignWithOpenSSLAndVerify_content")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ioutil.WriteFile(tmpContentFile.Name(), content, 0755)
-
-	// write the signer cert to a temp file
-	tmpSignerCertFile, err := ioutil.TempFile("", "TestDSASignWithOpenSSLAndVerify_signer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ioutil.WriteFile(tmpSignerCertFile.Name(), dsaPublicCert, 0755)
-
-	// write the signer key to a temp file
-	tmpSignerKeyFile, err := ioutil.TempFile("", "TestDSASignWithOpenSSLAndVerify_key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ioutil.WriteFile(tmpSignerKeyFile.Name(), dsaPrivateKey, 0755)
-
-	tmpSignedFile, err := ioutil.TempFile("", "TestDSASignWithOpenSSLAndVerify_signature")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// call openssl to sign the content
-	opensslCMD := exec.Command("openssl", "smime", "-sign", "-nodetach", "-md", "sha1",
-		"-in", tmpContentFile.Name(), "-out", tmpSignedFile.Name(),
-		"-signer", tmpSignerCertFile.Name(), "-inkey", tmpSignerKeyFile.Name(),
-		"-certfile", tmpSignerCertFile.Name(), "-outform", "PEM")
-	out, err := opensslCMD.CombinedOutput()
-	if err != nil {
-		t.Fatalf("openssl command failed with %s: %s", err, out)
-	}
-
-	// verify the signed content
-	pemSignature, err := ioutil.ReadFile(tmpSignedFile.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fmt.Printf("%s\n", pemSignature)
-	derBlock, _ := pem.Decode(pemSignature)
-	if derBlock == nil {
-		t.Fatalf("failed to read DER block from signature PEM %s", tmpSignedFile.Name())
-	}
-	p7, err := Parse(derBlock.Bytes)
-	if err != nil {
-		t.Fatalf("Parse encountered unexpected error: %v", err)
-	}
-	if err := p7.Verify(); err != nil {
-		t.Fatalf("Verify failed with error: %v", err)
-	}
-	os.Remove(tmpSignerCertFile.Name()) // clean up
-	os.Remove(tmpSignerKeyFile.Name())  // clean up
-	os.Remove(tmpContentFile.Name())    // clean up
-}
-
-var dsaPrivateKey = []byte(`-----BEGIN PRIVATE KEY-----
-MIIBSwIBADCCASwGByqGSM44BAEwggEfAoGBAP1/U4EddRIpUt9KnC7s5Of2EbdS
-PO9EAMMeP4C2USZpRV1AIlH7WT2NWPq/xfW6MPbLm1Vs14E7gB00b/JmYLdrmVCl
-pJ+f6AR7ECLCT7up1/63xhv4O1fnxqimFQ8E+4P208UewwI1VBNaFpEy9nXzrith
-1yrv8iIDGZ3RSAHHAhUAl2BQjxUjC8yykrmCouuEC/BYHPUCgYEA9+GghdabPd7L
-vKtcNrhXuXmUr7v6OuqC+VdMCz0HgmdRWVeOutRZT+ZxBxCBgLRJFnEj6EwoFhO3
-zwkyjMim4TwWeotUfI0o4KOuHiuzpnWRbqN/C/ohNWLx+2J6ASQ7zKTxvqhRkImo
-g9/hWuWfBpKLZl6Ae1UlZAFMO/7PSSoEFgIUfW4aPdQBn9gJZp2KuNpzgHzvfsE=
------END PRIVATE KEY-----`)
 
 var dsaPublicCert = []byte(`-----BEGIN CERTIFICATE-----
 MIIDOjCCAvWgAwIBAgIEPCY/UDANBglghkgBZQMEAwIFADBsMRAwDgYDVQQGEwdV
