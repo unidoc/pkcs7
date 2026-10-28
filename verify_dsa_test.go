@@ -3,22 +3,26 @@ package pkcs7
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"testing"
 )
 
 func TestVerifyEC2RejectsDSA(t *testing.T) {
-	fixture := UnmarshalDSATestFixture(EC2IdentityDocumentFixture)
+	fixture := unmarshalDSATestFixture(ec2IdentityDocumentFixture)
+	if fixture.Certificate == nil {
+		t.Fatal("failed to parse the DSA signer certificate")
+	}
 	p7, err := Parse(fixture.Input)
 	if err != nil {
 		t.Fatalf("Parse encountered unexpected error: %v", err)
 	}
 	p7.Certificates = []*x509.Certificate{fixture.Certificate}
-	if err := p7.Verify(); err != x509.ErrUnsupportedAlgorithm {
+	if err := p7.Verify(); !errors.Is(err, x509.ErrUnsupportedAlgorithm) {
 		t.Fatalf("Verify of a DSA signature returned %v, want x509.ErrUnsupportedAlgorithm", err)
 	}
 }
 
-var EC2IdentityDocumentFixture = `
+var ec2IdentityDocumentFixture = `
 -----BEGIN PKCS7-----
 MIAGCSqGSIb3DQEHAqCAMIACAQExCzAJBgUrDgMCGgUAMIAGCSqGSIb3DQEHAaCA
 JIAEggGmewogICJwcml2YXRlSXAiIDogIjE3Mi4zMC4wLjI1MiIsCiAgImRldnBh
@@ -78,13 +82,13 @@ CWCGSAFlAwQDAgUAAzAAMC0CFQCIgQtrZZ9hdZG1ROhR5hc8nYEmbgIUAIlgC688
 qzy/7yePTlhlpj+ahMM=
 -----END CERTIFICATE-----`)
 
-type DSATestFixture struct {
+type dsaTestFixture struct {
 	Input       []byte
 	Certificate *x509.Certificate
 }
 
-func UnmarshalDSATestFixture(testPEMBlock string) DSATestFixture {
-	var result DSATestFixture
+func unmarshalDSATestFixture(testPEMBlock string) dsaTestFixture {
+	var result dsaTestFixture
 	var derBlock *pem.Block
 	var pemBlock = []byte(testPEMBlock)
 	for {
