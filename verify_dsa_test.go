@@ -1,5 +1,3 @@
-// +build go1.11 go1.12 go1.13 go1.14 go1.15
-
 package pkcs7
 
 import (
@@ -13,6 +11,7 @@ import (
 )
 
 func TestVerifyEC2(t *testing.T) {
+	t.Skip("crypto/x509 does not verify DSA signatures since Go 1.16")
 	fixture := UnmarshalDSATestFixture(EC2IdentityDocumentFixture)
 	p7, err := Parse(fixture.Input)
 	if err != nil {
@@ -64,6 +63,7 @@ vSeDCOUMYQR7R9LINYwouHIziqQYMAkGByqGSM44BAMDLwAwLAIUWXBlk40xTwSw
 -----END CERTIFICATE-----`
 
 func TestDSASignWithOpenSSLAndVerify(t *testing.T) {
+	t.Skip("crypto/x509 does not verify DSA signatures since Go 1.16")
 	content := []byte(`
 A ship in port is safe,
 but that's not what ships are built for.
