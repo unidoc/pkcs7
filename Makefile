@@ -13,7 +13,7 @@ vet:
 	go vet .
 
 lint:
-	golint .
+	golangci-lint run
 
 unused:
 	unused .
@@ -26,4 +26,4 @@ staticcheck:
 
 gettools:
 	go get -u honnef.co/go/tools/...
-	go get -u golang.org/x/lint/golint
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1

@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - depguard
+  settings:
+    depguard:
+      rules:
+        no-test-code:
+          files:
+            - $all
+            - "!$test"
+          deny:
+            - pkg: testing
+              desc: test code must live in _test.go files
+            - pkg: github.com/stretchr/testify
+              desc: test code must live in _test.go files
