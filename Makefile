@@ -13,7 +13,7 @@ vet:
 	go vet .
 
 lint:
-	golint .
+	golangci-lint run
 
 unused:
 	unused .
