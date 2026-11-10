@@ -3,8 +3,6 @@ package pkcs7
 import (
 	"bytes"
 	"errors"
-	"fmt"
-	"io"
 )
 
 type asn1Object interface {
@@ -58,18 +56,27 @@ func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
 	return nil
 }
 
+// errBERTruncated is returned when the input ends before a value does: a
+// missing tag or length octet, or content shorter than its declared length.
+var errBERTruncated = errors.New("ber2der: length is more than available data")
+
 func ber2der(data []byte) ([]byte, error) {
 	out := new(bytes.Buffer)
 
-	obj, err := readObject(bytes.NewReader(data), 0)
+	obj, rest, err := readObject(data, 0)
 	if err != nil {
 		return nil, err
 	}
-	if obj == nil {
-		return nil, fmt.Errorf("error to parse BER")
-	}
 	if isEndOfContents(obj) {
 		return nil, errors.New("ber2der: unexpected end-of-contents octets")
+	}
+	// PDF signatures reserve space for the CMS value and pad it with zero
+	// bytes, so zeros may follow the value. Anything else is rejected, so
+	// that bytes outside the value cannot ride along unnoticed.
+	for _, b := range rest {
+		if b != 0 {
+			return nil, errors.New("ber2der: trailing data after the top-level value")
+		}
 	}
 	obj.EncodeTo(out)
 
@@ -136,7 +143,7 @@ func encodeLength(out *bytes.Buffer, length int) (err error) {
 
 // maxBERNesting limits how deeply constructed values may nest. Real CMS
 // structures stay well below it. The limit keeps hostile input from
-// overflowing the stack and bounds the content copied per nesting level.
+// overflowing the stack.
 const maxBERNesting = 64
 
 // isEndOfContents reports whether obj is the end-of-contents octets (00 00).
@@ -147,21 +154,19 @@ func isEndOfContents(obj asn1Object) bool {
 	return ok && po.length == 0 && po.tagBytes[0] == 0
 }
 
-// readObject reads one BER value from r. depth is the number of constructed
-// values enclosing it.
-func readObject(r *bytes.Reader, depth int) (obj asn1Object, err error) {
-	var tagB byte
-	if tagB, err = r.ReadByte(); err != nil {
-		return
+// readObject reads one BER value from the start of data and returns it with
+// the data that follows it. depth is the number of constructed values
+// enclosing it. The returned object aliases data rather than copying it.
+func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error) {
+	if len(data) < 2 {
+		return nil, nil, errBERTruncated
 	}
+	tagB, l := data[0], data[1]
+	data = data[2:]
 
 	primitive := tagB&0x20 == 0
 
-	var l byte
-	if l, err = r.ReadByte(); err != nil {
-		return nil, fmt.Errorf("end of ber data reached")
-	}
-	length := (int)(l & 0x7F)
+	length := int(l & 0x7F)
 	// A definite length of zero (0x00) is an empty value, not the indefinite
 	// form (0x80).
 	indefinite := false
@@ -169,98 +174,90 @@ func readObject(r *bytes.Reader, depth int) (obj asn1Object, err error) {
 		if primitive {
 			// X.690 8.1.3.2: the indefinite form is only allowed for
 			// constructed encodings.
-			return nil, errors.New("ber2der: indefinite length on primitive tag")
+			return nil, nil, errors.New("ber2der: indefinite length on primitive tag")
 		}
 		indefinite = true
 	} else if l > 0x80 {
 		numberOfBytes := length
-		length = 0
 		if numberOfBytes > 4 { // int is only guaranteed to be 32bit
-			return nil, errors.New("ber2der: BER tag length too long")
+			return nil, nil, errors.New("ber2der: BER tag length too long")
 		}
-		for i := 0; i < numberOfBytes; i++ {
-			var sl byte
-			if sl, err = r.ReadByte(); err != nil {
-				return nil, fmt.Errorf("length is more than available data")
-			}
-			if i == 0 {
-				if numberOfBytes == 4 && (int)(sl) > 0x7F {
-					return nil, errors.New("ber2der: BER tag length is negative")
-				}
-				if 0x0 == (int)(sl) {
-					return nil, errors.New("ber2der: BER tag length has leading zero")
-				}
-			}
-			length = length*256 + (int)(sl)
+		if len(data) < numberOfBytes {
+			return nil, nil, errBERTruncated
 		}
+		if numberOfBytes == 4 && data[0] > 0x7F {
+			return nil, nil, errors.New("ber2der: BER tag length is negative")
+		}
+		if data[0] == 0 {
+			return nil, nil, errors.New("ber2der: BER tag length has leading zero")
+		}
+		length = 0
+		for _, sl := range data[:numberOfBytes] {
+			length = length<<8 | int(sl)
+		}
+		data = data[numberOfBytes:]
 	}
 
 	if tagB == 0 && length != 0 {
 		// Tag 0 is only valid as the end-of-contents octets (X.690 8.1.5).
-		return nil, errors.New("ber2der: tag 0 with content")
+		return nil, nil, errors.New("ber2der: tag 0 with content")
 	}
 
 	if primitive {
-		// Check the declared length against the remaining input before
-		// allocating, so a hostile length cannot force a large allocation.
-		if length > r.Len() {
-			return nil, fmt.Errorf("Invalid BER format")
+		if length > len(data) {
+			return nil, nil, errBERTruncated
 		}
-		p := asn1Primitive{
+		obj = asn1Primitive{
 			tagBytes: []byte{tagB},
 			length:   length,
-			content:  make([]byte, length),
+			content:  data[:length],
 		}
-		if length > 0 {
-			if _, err = io.ReadFull(r, p.content); err != nil {
-				return nil, fmt.Errorf("Invalid BER format")
-			}
-		}
-		obj = p
-		return
+		return obj, data[length:], nil
 	}
 
 	if depth >= maxBERNesting {
-		return nil, errors.New("ber2der: BER nesting too deep")
+		return nil, nil, errors.New("ber2der: BER nesting too deep")
 	}
 	subObjects := make([]asn1Object, 0)
-	if !indefinite {
-		if length > r.Len() {
-			return nil, fmt.Errorf("length is more than available data")
-		}
-		content := make([]byte, length)
-		if _, err = io.ReadFull(r, content); err != nil {
-			return nil, fmt.Errorf("length is more than available data")
-		}
-		r = bytes.NewReader(content)
-	}
-	for {
-		if !indefinite && r.Len() == 0 {
-			// Definite length: the content has been consumed exactly.
-			break
-		}
-		var sobj asn1Object
-		sobj, err = readObject(r, depth+1)
-		if err != nil {
-			if err == io.EOF {
-				// Only the indefinite form can reach here: the input ended
-				// before the end-of-contents octets.
-				return nil, errors.New("ber2der: missing end-of-contents octets")
+	if indefinite {
+		// The content runs until the end-of-contents octets.
+		for {
+			// Every value, the end-of-contents octets included, takes at
+			// least two bytes.
+			if len(data) < 2 {
+				return nil, nil, errors.New("ber2der: missing end-of-contents octets")
 			}
-			return nil, err
-		}
-		if isEndOfContents(sobj) {
-			if !indefinite {
-				return nil, errors.New("ber2der: unexpected end-of-contents octets")
+			var sobj asn1Object
+			if sobj, data, err = readObject(data, depth+1); err != nil {
+				return nil, nil, err
 			}
-			// End-of-contents (00 00) terminates the indefinite value.
-			break
+			if isEndOfContents(sobj) {
+				break
+			}
+			subObjects = append(subObjects, sobj)
 		}
-		subObjects = append(subObjects, sobj)
+		rest = data
+	} else {
+		if length > len(data) {
+			return nil, nil, errBERTruncated
+		}
+		content := data[:length]
+		rest = data[length:]
+		// The declared length must be consumed exactly by whole values.
+		for len(content) > 0 {
+			var sobj asn1Object
+			if sobj, content, err = readObject(content, depth+1); err != nil {
+				return nil, nil, err
+			}
+			if isEndOfContents(sobj) {
+				return nil, nil, errors.New("ber2der: unexpected end-of-contents octets")
+			}
+			subObjects = append(subObjects, sobj)
+		}
 	}
 	obj = asn1Structured{
 		tagBytes: []byte{tagB},
 		content:  subObjects,
 	}
-	return
+	return obj, rest, nil
 }

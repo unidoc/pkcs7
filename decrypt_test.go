@@ -2,6 +2,7 @@ package pkcs7
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -58,3 +59,27 @@ o5FC5Jg2FUfFzZSDmyZ6IONUsdF/i78KDV5nRv1R+hI6/oRlWNCtTNBv/lvBBd6b
 dseUE9QoaQZsn5lpILEvmQJAZ0B+Or1rAYjnbjnUhdVZoy9kC4Zov+4UH3N/BtSy
 KJRWUR0wTWfZBPZ5hAYZjTBEAFULaYCXlQKsODSp0M1aQA==
 -----END PRIVATE KEY-----`
+
+func TestDecryptUsingPSKWrongKeyLength(t *testing.T) {
+	// The key length must match the algorithm the content names: a 32-byte
+	// key must not decrypt content labelled AES-128 as AES-256.
+	defer func(alg int) { ContentEncryptionAlgorithm = alg }(ContentEncryptionAlgorithm)
+	ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
+	key := []byte("128BitKey4AESGCM")
+	der, err := EncryptUsingPSK([]byte("secret"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range [][]byte{append(key, key...), key[:8], append(key, key[:8]...)} {
+		if _, err := p7.DecryptUsingPSK(k); err == nil || !strings.Contains(err.Error(), "invalid content key length") {
+			t.Errorf("%d-byte key: got %v, want key length error", len(k), err)
+		}
+	}
+	if _, err := p7.DecryptUsingPSK(key); err != nil {
+		t.Errorf("correct key: %v", err)
+	}
+}

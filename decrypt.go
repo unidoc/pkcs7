@@ -59,17 +59,18 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 		if err != nil {
 			return nil, err
 		}
-		lengths, err := data.EncryptedContentInfo.contentKeyLengths()
+		cc, err := data.EncryptedContentInfo.contentCipher()
 		if err != nil {
 			return nil, err
 		}
 		// The RSA plaintext has one length, so at most one candidate is
 		// replaced by the real key. Pick that one, or the first fallback when
 		// none is, without branching on which, and decrypt the content once.
-		keys := make([][]byte, len(lengths))
+		kdk := implicitRejectionKDK(priv)
+		keys := make([][]byte, len(cc.keyLengths))
 		idx := 0
-		for i, n := range lengths {
-			fallback := implicitRejectionKey(priv, ciphertext, n)
+		for i, n := range cc.keyLengths {
+			fallback := implicitRejectionKey(kdk, ciphertext, n)
 			keys[i] = append([]byte(nil), fallback...)
 			// Only ciphertext and key size problems are reported here, and
 			// those are public.
@@ -79,7 +80,7 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 			replaced := 1 - subtle.ConstantTimeCompare(keys[i], fallback)
 			idx = subtle.ConstantTimeSelect(replaced, i, idx)
 		}
-		return data.EncryptedContentInfo.decrypt(keys[idx])
+		return data.EncryptedContentInfo.decryptWith(cc, keys[idx])
 	}
 	return nil, ErrUnsupportedAlgorithm
 }
@@ -101,13 +102,19 @@ func canonicalCiphertext(priv *rsa.PrivateKey, ciphertext []byte) ([]byte, error
 	return out, nil
 }
 
-// implicitRejectionKey returns an n-byte fallback key: HMAC-SHA256, keyed by a
-// hash of the private exponent, over n and the ciphertext. It is deterministic
-// and unpredictable without the private key. n is included so that keys of
-// different lengths are not prefixes of each other.
-func implicitRejectionKey(priv *rsa.PrivateKey, ciphertext []byte, n int) []byte {
+// implicitRejectionKDK returns the key-derivation key for
+// implicitRejectionKey: a hash of the private exponent.
+func implicitRejectionKDK(priv *rsa.PrivateKey) []byte {
 	kdk := sha256.Sum256(priv.D.Bytes())
-	mac := hmac.New(sha256.New, kdk[:])
+	return kdk[:]
+}
+
+// implicitRejectionKey returns an n-byte fallback key: HMAC-SHA256, keyed by
+// kdk from implicitRejectionKDK, over n and the ciphertext. It is
+// deterministic and unpredictable without the private key. n is included so
+// that keys of different lengths are not prefixes of each other.
+func implicitRejectionKey(kdk, ciphertext []byte, n int) []byte {
+	mac := hmac.New(sha256.New, kdk)
 	key := make([]byte, 0, n+sha256.Size)
 	for i := 0; len(key) < n; i++ {
 		mac.Reset()
@@ -118,33 +125,121 @@ func implicitRejectionKey(priv *rsa.PrivateKey, ciphertext []byte, n int) []byte
 	return key[:n]
 }
 
-// contentKeyLengths returns the content-encryption key lengths in bytes that
-// the algorithm in eci accepts. The first is used when the padding is invalid.
-func (eci encryptedContentInfo) contentKeyLengths() ([]int, error) {
-	alg := eci.ContentEncryptionAlgorithm.Algorithm
-	switch {
-	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
-		return []int{8}, nil
-	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
-		return []int{24}, nil
-	case alg.Equal(OIDEncryptionAlgorithmAES128CBC), alg.Equal(OIDEncryptionAlgorithmAES128GCM):
-		return []int{16}, nil
-	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
-		return []int{32}, nil
-	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
-		// The RC2 key length is not encoded. Producers use the effective key
-		// length, but some S/MIME clients transport a 16-byte key with a
-		// shorter effective length, so both are accepted.
-		_, bits, err := rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
-		if err != nil {
-			return nil, err
+// contentCipher is a content-encryption algorithm with its parameters
+// decoded: everything decryptWith needs besides the key.
+type contentCipher struct {
+	// keyLengths are the key lengths in bytes the algorithm accepts. The
+	// first is used when the RSA padding is invalid.
+	keyLengths []int
+	// newCipher builds the block cipher for key. It rejects a key whose
+	// length the algorithm does not allow.
+	newCipher func(key []byte) (cipher.Block, error)
+	// iv is the CBC initialisation vector; unused for GCM.
+	iv []byte
+	// gcm holds the AES-GCM parameters, or nil for a CBC algorithm.
+	gcm *aesGCMParameters
+}
+
+// contentCipherSpec ties a content-encryption algorithm OID to the decoding
+// of its parameters.
+type contentCipherSpec struct {
+	oid     asn1.ObjectIdentifier
+	resolve func(params asn1.RawValue) (contentCipher, error)
+}
+
+// contentCipherSpecs lists the content-encryption algorithms this package
+// can decrypt. Both key selection and content decryption consult it, and the
+// cipher constructors enforce the key lengths, so the two cannot drift apart.
+var contentCipherSpecs = []contentCipherSpec{
+	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher)},
+	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher)},
+	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aes.NewCipher)},
+	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aes.NewCipher)},
+	{OIDEncryptionAlgorithmAES128GCM, gcmCipher(16)},
+	{OIDEncryptionAlgorithmAES256GCM, gcmCipher(32)},
+	{OIDEncryptionAlgorithmRC2CBC, rc2CBCCipher},
+}
+
+// contentCipher looks up the content-encryption algorithm in eci and decodes
+// its parameters.
+func (eci encryptedContentInfo) contentCipher() (contentCipher, error) {
+	alg := eci.ContentEncryptionAlgorithm
+	for _, spec := range contentCipherSpecs {
+		if spec.oid.Equal(alg.Algorithm) {
+			return spec.resolve(alg.Parameters)
 		}
-		if n := (bits + 7) / 8; n != 16 {
-			return []int{n, 16}, nil
-		}
-		return []int{16}, nil
 	}
-	return nil, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg)
+	return contentCipher{}, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg.Algorithm)
+}
+
+// cbcCipher describes a CBC algorithm with a fixed key length whose
+// parameters are the bare IV.
+func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error)) func(asn1.RawValue) (contentCipher, error) {
+	return func(params asn1.RawValue) (contentCipher, error) {
+		return contentCipher{
+			keyLengths: []int{keyLen},
+			newCipher:  fixedKeyLength(keyLen, newCipher),
+			iv:         params.Bytes,
+		}, nil
+	}
+}
+
+// fixedKeyLength wraps newCipher so that it accepts only keyLen-byte keys.
+// aes.NewCipher alone would accept any AES key size, running AES-256 for
+// content labelled AES-128.
+func fixedKeyLength(keyLen int, newCipher func(key []byte) (cipher.Block, error)) func(key []byte) (cipher.Block, error) {
+	return func(key []byte) (cipher.Block, error) {
+		if len(key) != keyLen {
+			return nil, fmt.Errorf("pkcs7: invalid content key length %d, want %d", len(key), keyLen)
+		}
+		return newCipher(key)
+	}
+}
+
+// gcmCipher describes AES-GCM with a fixed key length. The parameters are
+// the GCMParameters SEQUENCE.
+func gcmCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
+	return func(params asn1.RawValue) (contentCipher, error) {
+		var p aesGCMParameters
+		if _, err := asn1.Unmarshal(params.Bytes, &p); err != nil {
+			return contentCipher{}, err
+		}
+		return contentCipher{
+			keyLengths: []int{keyLen},
+			newCipher:  fixedKeyLength(keyLen, aes.NewCipher),
+			gcm:        &p,
+		}, nil
+	}
+}
+
+// rc2CBCCipher describes RC2-CBC. The effective key length comes from the
+// parameters, the key length is not encoded at all, so newCipher accepts any
+// key length RC2 supports; keyLengths only lists the likely candidates.
+func rc2CBCCipher(params asn1.RawValue) (contentCipher, error) {
+	iv, bits, err := rc2Params(params)
+	if err != nil {
+		return contentCipher{}, err
+	}
+	// Producers use the effective key length, but some S/MIME clients
+	// transport a 16-byte key with a shorter effective length, so both are
+	// accepted.
+	lengths := []int{16}
+	if n := (bits + 7) / 8; n != 16 {
+		lengths = []int{n, 16}
+	}
+	return contentCipher{
+		keyLengths: lengths,
+		newCipher: func(key []byte) (cipher.Block, error) {
+			// The key and the parameters come from the envelope, so both
+			// are attacker-controlled; the RC2 implementation panics outside
+			// these ranges.
+			if len(key) < 1 || len(key) > rc2MaxKeyBytes {
+				return nil, fmt.Errorf("pkcs7: invalid RC2 key length %d", len(key))
+			}
+			return rc2.New(key, bits)
+		},
+		iv: iv,
+	}, nil
 }
 
 // DecryptUsingPSK decrypts encrypted data using caller provided
@@ -200,9 +295,18 @@ func rc2Params(params asn1.RawValue) (iv []byte, effectiveBits int, err error) {
 	return p.IV, bits, nil
 }
 
+// decrypt decrypts the content with key.
 func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
-	alg := eci.ContentEncryptionAlgorithm.Algorithm
+	cc, err := eci.contentCipher()
+	if err != nil {
+		return nil, err
+	}
+	return eci.decryptWith(cc, key)
+}
 
+// decryptWith decrypts the content with key using the algorithm resolved by
+// contentCipher.
+func (eci encryptedContentInfo) decryptWith(cc contentCipher, key []byte) ([]byte, error) {
 	// EncryptedContent can either be constructed of multple OCTET STRINGs
 	// or _be_ a tagged OCTET STRING
 	var cyphertext []byte
@@ -225,81 +329,32 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 		cyphertext = eci.EncryptedContent.Bytes
 	}
 
-	var block cipher.Block
-	var err error
-	// iv is the CBC initialisation vector; nil until the algorithm's
-	// parameters have been decoded.
-	var iv []byte
-
-	switch {
-	case alg.Equal(OIDEncryptionAlgorithmDESCBC):
-		block, err = des.NewCipher(key)
-		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
-	case alg.Equal(OIDEncryptionAlgorithmDESEDE3CBC):
-		block, err = des.NewTripleDESCipher(key)
-		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
-	case alg.Equal(OIDEncryptionAlgorithmAES256CBC), alg.Equal(OIDEncryptionAlgorithmAES256GCM):
-		fallthrough
-	case alg.Equal(OIDEncryptionAlgorithmAES128GCM), alg.Equal(OIDEncryptionAlgorithmAES128CBC):
-		block, err = aes.NewCipher(key)
-		iv = eci.ContentEncryptionAlgorithm.Parameters.Bytes
-	case alg.Equal(OIDEncryptionAlgorithmRC2CBC):
-		// The key and the parameters come from the envelope, so both are
-		// attacker-controlled; the RC2 implementation panics outside these
-		// ranges.
-		if len(key) < 1 || len(key) > rc2MaxKeyBytes {
-			return nil, fmt.Errorf("pkcs7: invalid RC2 key length %d", len(key))
-		}
-		var bits int
-		iv, bits, err = rc2Params(eci.ContentEncryptionAlgorithm.Parameters)
-		if err != nil {
-			return nil, err
-		}
-		block, err = rc2.New(key, bits)
-	default:
-		return nil, fmt.Errorf("%w: content encryption algorithm %v", ErrUnsupportedAlgorithm, alg)
-	}
-
+	block, err := cc.newCipher(key)
 	if err != nil {
 		return nil, err
 	}
 
-	if alg.Equal(OIDEncryptionAlgorithmAES128GCM) || alg.Equal(OIDEncryptionAlgorithmAES256GCM) {
-		params := aesGCMParameters{}
-		paramBytes := eci.ContentEncryptionAlgorithm.Parameters.Bytes
-
-		_, err := asn1.Unmarshal(paramBytes, &params)
-		if err != nil {
-			return nil, err
-		}
-
+	if cc.gcm != nil {
 		gcm, err := cipher.NewGCM(block)
 		if err != nil {
 			return nil, err
 		}
-
-		if len(params.Nonce) != gcm.NonceSize() {
+		if len(cc.gcm.Nonce) != gcm.NonceSize() {
 			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
 		}
-		if params.ICVLen != gcm.Overhead() {
+		if cc.gcm.ICVLen != gcm.Overhead() {
 			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
 		}
-
-		plaintext, err := gcm.Open(nil, params.Nonce, cyphertext, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		return plaintext, nil
+		return gcm.Open(nil, cc.gcm.Nonce, cyphertext, nil)
 	}
 
-	if len(iv) != block.BlockSize() {
+	if len(cc.iv) != block.BlockSize() {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are malformed")
 	}
 	if len(cyphertext) == 0 || len(cyphertext)%block.BlockSize() != 0 {
 		return nil, errors.New("pkcs7: invalid ciphertext length")
 	}
-	mode := cipher.NewCBCDecrypter(block, iv)
+	mode := cipher.NewCBCDecrypter(block, cc.iv)
 	plaintext := make([]byte, len(cyphertext))
 	mode.CryptBlocks(plaintext, cyphertext)
 	if plaintext, err = unpad(plaintext, mode.BlockSize()); err != nil {

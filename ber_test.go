@@ -3,6 +3,8 @@ package pkcs7
 import (
 	"bytes"
 	"encoding/asn1"
+	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -47,9 +49,17 @@ func TestBer2Der_Negatives(t *testing.T) {
 		{[]byte{0x30, 0x85}, "tag length too long"},
 		{[]byte{0x30, 0x84, 0x80, 0x0, 0x0, 0x0}, "length is negative"},
 		{[]byte{0x30, 0x82, 0x0, 0x1}, "length has leading zero"},
-		{[]byte{0x30, 0x80, 0x1, 0x2}, "Invalid BER format"},
-		{[]byte{0x30, 0x03, 0x01, 0x02}, "length is more than available data"},
-		{[]byte{0x30}, "end of ber data reached"},
+		{[]byte{0x30, 0x80, 0x1, 0x2}, "ber2der: length is more than available data"},
+		{[]byte{0x30, 0x03, 0x01, 0x02}, "ber2der: length is more than available data"},
+		{[]byte{0x30, 0x03, 0x30, 0x02, 0x01}, "ber2der: length is more than available data"},
+		{[]byte{0x30, 0x81}, "ber2der: length is more than available data"},
+		{[]byte{0x30, 0x84, 0x01}, "ber2der: length is more than available data"},
+		{[]byte{0x30}, "ber2der: length is more than available data"},
+		{[]byte{}, "ber2der: length is more than available data"},
+		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01}, "ber2der: missing end-of-contents octets"},
+		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00}, "ber2der: missing end-of-contents octets"},
+		{[]byte{0x30, 0x00, 0x01}, "ber2der: trailing data after the top-level value"},
+		{[]byte{0x30, 0x00, 0x00, 0x00, 0xFF}, "ber2der: trailing data after the top-level value"},
 	}
 
 	for _, fixture := range fixtures {
@@ -170,6 +180,11 @@ func TestBer2DerValidUnchanged(t *testing.T) {
 			[]byte{0x04, 0x02, 0x01, 0x02},
 		},
 		{
+			"zero padding after the value is dropped",
+			[]byte{0x30, 0x03, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00},
+			[]byte{0x30, 0x03, 0x02, 0x01, 0x01},
+		},
+		{
 			"long-form definite length",
 			append([]byte{0x04, 0x81, 0x80}, bytes.Repeat([]byte{0xAB}, 128)...),
 			append([]byte{0x04, 0x81, 0x80}, bytes.Repeat([]byte{0xAB}, 128)...),
@@ -257,8 +272,8 @@ func TestBer2DerHostileNesting(t *testing.T) {
 		t.Error("Parse of deep indefinite nesting: expected error, got nil")
 	}
 
-	// 8000 nested definite-length SEQUENCEs (about 31 KB). Each nesting level
-	// copies its content, so the depth limit must keep the total small.
+	// 8000 nested definite-length SEQUENCEs (about 31 KB). Parsing works over
+	// sub-slices of the input, so rejecting it must not allocate much.
 	nested := nestedDefinite(8000)
 	var before, after runtime.MemStats
 	runtime.GC()
@@ -271,5 +286,22 @@ func TestBer2DerHostileNesting(t *testing.T) {
 	const limit = 16 << 20
 	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > limit {
 		t.Errorf("deep definite nesting allocated %d bytes, want at most %d", alloc, limit)
+	}
+}
+
+func TestParseTrailingBytes(t *testing.T) {
+	// PDF signature contents are zero-padded to the reserved size, so zeros
+	// after the CMS value are accepted; any other trailing byte is not.
+	data, err := os.ReadFile(filepath.Join("testdata", "openssl_aes128cbc.der"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := append(append([]byte(nil), data...), make([]byte, 512)...)
+	if _, err := Parse(padded); err != nil {
+		t.Errorf("Parse with zero padding: %v", err)
+	}
+	junk := append(append([]byte(nil), padded...), 0x01)
+	if _, err := Parse(junk); err == nil || !strings.Contains(err.Error(), "trailing data") {
+		t.Errorf("Parse with trailing junk: got %v, want trailing data error", err)
 	}
 }
