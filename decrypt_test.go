@@ -2,7 +2,7 @@ package pkcs7
 
 import (
 	"bytes"
-	"strings"
+	"encoding/hex"
 	"testing"
 )
 
@@ -60,9 +60,9 @@ dseUE9QoaQZsn5lpILEvmQJAZ0B+Or1rAYjnbjnUhdVZoy9kC4Zov+4UH3N/BtSy
 KJRWUR0wTWfZBPZ5hAYZjTBEAFULaYCXlQKsODSp0M1aQA==
 -----END PRIVATE KEY-----`
 
-func TestDecryptUsingPSKWrongKeyLength(t *testing.T) {
-	// The key length must match the algorithm the content names: a 32-byte
-	// key must not decrypt content labelled AES-128 as AES-256.
+func TestDecryptUsingPSKWrongKey(t *testing.T) {
+	// Keys of another length fail, whether or not it is a valid AES size,
+	// and the right key still works.
 	defer func(alg int) { ContentEncryptionAlgorithm = alg }(ContentEncryptionAlgorithm)
 	ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
 	key := []byte("128BitKey4AESGCM")
@@ -75,11 +75,49 @@ func TestDecryptUsingPSKWrongKeyLength(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, k := range [][]byte{append(key, key...), key[:8], append(key, key[:8]...)} {
-		if _, err := p7.DecryptUsingPSK(k); err == nil || !strings.Contains(err.Error(), "invalid content key length") {
-			t.Errorf("%d-byte key: got %v, want key length error", len(k), err)
+		if _, err := p7.DecryptUsingPSK(k); err == nil {
+			t.Errorf("%d-byte key: no error", len(k))
 		}
 	}
 	if _, err := p7.DecryptUsingPSK(key); err != nil {
 		t.Errorf("correct key: %v", err)
+	}
+}
+
+// legacyPSKFixtures were written by v0.4.2's EncryptUsingPSK with a key of
+// bytes 0, 1, 2, ... of the wrong AES size for the configured algorithm,
+// which it encrypted with anyway. They must stay decryptable.
+var legacyPSKFixtures = map[string]struct {
+	keyLen int
+	der    string
+}{
+	"AES-128-GCM label, 32-byte key": {32, "306506092a864886f70d010706a0583056020100305106092a864886f70d0107013020060960864801650304010610133011840c31af4a00c56e82ad728fd6820201108022cff53328370ff30d01f855c24225bb5b364c7e7470f89d53bf0c5f797576e8057593"},
+	"AES-256-GCM label, 16-byte key": {16, "306506092a864886f70d010706a0583056020100305106092a864886f70d0107013020060960864801650304012e10133011840c201ec5148055cede6f28e06c020110802288516b0ff65799f6eb5bb5110596150c22951b735db8a5da3a958b681e2a8f3e70c7"},
+}
+
+func TestDecryptUsingPSKLegacyKeySize(t *testing.T) {
+	for name, f := range legacyPSKFixtures {
+		der, err := hex.DecodeString(f.der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p7, err := Parse(der)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		key := make([]byte, f.keyLen)
+		for i := range key {
+			key[i] = byte(i)
+		}
+		got, err := p7.DecryptUsingPSK(key)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		} else if string(got) != "legacy PSK content" {
+			t.Errorf("%s: decrypted %q", name, got)
+		}
+		key[0]++
+		if _, err := p7.DecryptUsingPSK(key); err == nil {
+			t.Errorf("%s: wrong key of the legacy size: no error", name)
+		}
 	}
 }

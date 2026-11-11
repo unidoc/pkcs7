@@ -102,8 +102,8 @@ func TestEncryptUsingPSKWrongKeyLength(t *testing.T) {
 		}
 	}
 	for _, alg := range []int{EncryptionAlgorithmAES128CBC, EncryptionAlgorithmAES256CBC} {
-		if _, _, err := encryptAESCBC([]byte("secret"), make([]byte, 24), alg); err == nil {
-			t.Errorf("encryptAESCBC alg %d with a 24-byte key: no error", alg)
+		if _, _, err := encryptAESCBC([]byte("secret"), make([]byte, 24), alg); err == nil || !strings.Contains(err.Error(), "invalid content key length") {
+			t.Errorf("encryptAESCBC alg %d with a 24-byte key: got %v, want key length error", alg, err)
 		}
 	}
 }

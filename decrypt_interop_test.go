@@ -3,6 +3,7 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -223,6 +224,132 @@ func TestEncryptRC2Parameters(t *testing.T) {
 	}
 	if bits != 128 || len(iv) != 8 {
 		t.Errorf("effective bits %d, iv len %d", bits, len(iv))
+	}
+}
+
+// standardGCMEncryptedData returns an EncryptedData content info whose
+// parameters are RFC 5084 GCMParameters as OpenSSL writes them: a bare
+// SEQUENCE of an OCTET STRING nonce and an INTEGER tag length, omitted
+// when it is the default 12.
+func standardGCMEncryptedData(t *testing.T, oid asn1.ObjectIdentifier, key, plaintext []byte, tagSize int) []byte {
+	t.Helper()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCMWithTagSize(block, tagSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	for i := range nonce {
+		nonce[i] = byte(0xA0 + i)
+	}
+	params := append([]byte{asn1.TagOctetString, byte(len(nonce))}, nonce...)
+	if tagSize != 12 {
+		params = append(params, asn1.TagInteger, 1, byte(tagSize))
+	}
+	params = append([]byte{0x30, byte(len(params))}, params...)
+	var raw asn1.RawValue
+	if _, err := asn1.Unmarshal(params, &raw); err != nil {
+		t.Fatal(err)
+	}
+	ed := encryptedData{
+		EncryptedContentInfo: encryptedContentInfo{
+			ContentType:                OIDData,
+			ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{Algorithm: oid, Parameters: raw},
+			EncryptedContent:           marshalEncryptedContent(gcm.Seal(nil, nonce, plaintext, nil)),
+		},
+	}
+	inner, err := asn1.Marshal(ed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := asn1.Marshal(contentInfo{
+		ContentType: OIDEncryptedData,
+		Content:     asn1.RawValue{Class: 2, Tag: 0, IsCompound: true, Bytes: inner},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
+}
+
+func TestDecryptAESGCMStandardParameters(t *testing.T) {
+	plaintext := []byte("RFC 5084 parameters")
+	for name, tt := range map[string]struct {
+		oid     asn1.ObjectIdentifier
+		keyLen  int
+		tagSize int
+	}{
+		"AES-128-GCM, 16-byte tag":         {OIDEncryptionAlgorithmAES128GCM, 16, 16},
+		"AES-256-GCM, 16-byte tag":         {OIDEncryptionAlgorithmAES256GCM, 32, 16},
+		"AES-128-GCM, default 12-byte tag": {OIDEncryptionAlgorithmAES128GCM, 16, 12},
+		"AES-256-GCM, 13-byte tag":         {OIDEncryptionAlgorithmAES256GCM, 32, 13},
+	} {
+		t.Run(name, func(t *testing.T) {
+			key := make([]byte, tt.keyLen)
+			for i := range key {
+				key[i] = byte(i)
+			}
+			p7, err := Parse(standardGCMEncryptedData(t, tt.oid, key, plaintext, tt.tagSize))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := p7.DecryptUsingPSK(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, plaintext) {
+				t.Errorf("decrypted %q", got)
+			}
+			key[0]++
+			if _, err := p7.DecryptUsingPSK(key); err == nil {
+				t.Error("wrong key: no error")
+			}
+		})
+	}
+}
+
+func TestParseGCMParameters(t *testing.T) {
+	nonce := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	raw := func(b []byte) asn1.RawValue {
+		var rv asn1.RawValue
+		if _, err := asn1.Unmarshal(b, &rv); err != nil {
+			t.Fatal(err)
+		}
+		return rv
+	}
+	standard := append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x10)
+	legacy, err := asn1.Marshal(aesGCMParameters{Nonce: nonce, ICVLen: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tt := range map[string]struct {
+		params asn1.RawValue
+		icvLen int
+	}{
+		"standard":            {raw(standard), 16},
+		"standard, no ICVlen": {raw(append([]byte{0x30, 0x0E, 0x04, 0x0C}, nonce...)), 12},
+		"legacy":              {asn1.RawValue{Tag: asn1.TagSequence, Bytes: legacy}, 16},
+	} {
+		p, err := parseGCMParameters(tt.params)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if !bytes.Equal(p.Nonce, nonce) || p.ICVLen != tt.icvLen {
+			t.Errorf("%s: nonce % X, ICVlen %d", name, p.Nonce, p.ICVLen)
+		}
+	}
+	for name, params := range map[string][]byte{
+		"ICVlen too short": append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0B),
+		"ICVlen too long":  append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x11),
+		"not a sequence":   append([]byte{0x04, 0x0C}, nonce...),
+	} {
+		if _, err := parseGCMParameters(raw(params)); err == nil {
+			t.Errorf("%s: no error", name)
+		}
 	}
 }
 

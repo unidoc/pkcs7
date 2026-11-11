@@ -35,7 +35,6 @@ func (s asn1Structured) EncodeTo(out *bytes.Buffer) error {
 
 type asn1Primitive struct {
 	tagBytes []byte
-	length   int
 	content  []byte
 }
 
@@ -48,7 +47,7 @@ func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
 	if err != nil {
 		return err
 	}
-	if err = encodeLength(out, p.length); err != nil {
+	if err = encodeLength(out, len(p.content)); err != nil {
 		return err
 	}
 	out.Write(p.content)
@@ -146,7 +145,7 @@ const maxBERNesting = 64
 // can reach it. Outside an indefinite-length value it is an error.
 func isEndOfContents(obj asn1Object) bool {
 	po, ok := obj.(asn1Primitive)
-	return ok && po.length == 0 && po.tagBytes[0] == 0
+	return ok && len(po.content) == 0 && po.tagBytes[0] == 0
 }
 
 // maxTagContinuation is the most continuation octets a high-tag-number form
@@ -164,10 +163,6 @@ func readTag(data []byte) (tag, rest []byte, err error) {
 	if data[0]&0x1F != 0x1F {
 		return data[:1], data[1:], nil
 	}
-	if len(data) > 1 && data[1] == 0x80 {
-		// 8.1.2.4.2 c: the first continuation octet must not be zero.
-		return nil, nil, errors.New("ber2der: BER tag number has leading zero")
-	}
 	number := 0
 	for i := 1; ; i++ {
 		if i >= len(data) {
@@ -175,6 +170,10 @@ func readTag(data []byte) (tag, rest []byte, err error) {
 		}
 		if i > maxTagContinuation {
 			return nil, nil, errors.New("ber2der: BER tag number too long")
+		}
+		if i == 1 && data[i] == 0x80 {
+			// 8.1.2.4.2 c: the first continuation octet must not be zero.
+			return nil, nil, errors.New("ber2der: BER tag number has leading zero")
 		}
 		number = number<<7 | int(data[i]&0x7F)
 		if data[i]&0x80 == 0 {
@@ -246,7 +245,6 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		}
 		obj = asn1Primitive{
 			tagBytes: tagBytes,
-			length:   length,
 			content:  data[:length],
 		}
 		return obj, data[length:], nil

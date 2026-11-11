@@ -137,7 +137,18 @@ type contentCipher struct {
 	// iv is the CBC initialisation vector; unused for GCM.
 	iv []byte
 	// gcm holds the AES-GCM parameters, or nil for a CBC algorithm.
-	gcm *aesGCMParameters
+	gcm *gcmParameters
+	// legacyAES marks an AES algorithm. Earlier versions of EncryptUsingPSK
+	// used whatever AES key size the caller passed and labelled the content
+	// with the configured algorithm, so DecryptUsingPSK accepts the other
+	// AES key sizes for such content.
+	legacyAES bool
+}
+
+// gcmParameters is GCMParameters from RFC 5084 §3.2.
+type gcmParameters struct {
+	Nonce  []byte
+	ICVLen int `asn1:"optional,default:12"`
 }
 
 // contentCipherSpec ties a content-encryption algorithm OID to the decoding
@@ -153,8 +164,8 @@ type contentCipherSpec struct {
 var contentCipherSpecs = []contentCipherSpec{
 	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher)},
 	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher)},
-	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aesCipher(16))},
-	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aesCipher(32))},
+	{OIDEncryptionAlgorithmAES128CBC, aesCBCCipher(16)},
+	{OIDEncryptionAlgorithmAES256CBC, aesCBCCipher(32)},
 	{OIDEncryptionAlgorithmAES128GCM, gcmCipher(16)},
 	{OIDEncryptionAlgorithmAES256GCM, gcmCipher(32)},
 	{OIDEncryptionAlgorithmRC2CBC, rc2CBCCipher},
@@ -184,10 +195,20 @@ func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error)) fun
 	}
 }
 
+// aesCBCCipher describes AES-CBC with a fixed key length.
+func aesCBCCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
+	resolve := cbcCipher(keyLen, aesCipher(keyLen))
+	return func(params asn1.RawValue) (contentCipher, error) {
+		cc, err := resolve(params)
+		cc.legacyAES = true
+		return cc, err
+	}
+}
+
 // aesCipher returns an AES constructor that accepts only keyLen-byte keys.
 // aes.NewCipher alone accepts every AES key size, so it would run AES-256
-// for content labelled AES-128. The DES constructors already reject other
-// key sizes themselves.
+// for content labelled AES-128. The encrypters use it as well. The DES
+// constructors already reject other key sizes themselves.
 func aesCipher(keyLen int) func(key []byte) (cipher.Block, error) {
 	return func(key []byte) (cipher.Block, error) {
 		if len(key) != keyLen {
@@ -197,20 +218,40 @@ func aesCipher(keyLen int) func(key []byte) (cipher.Block, error) {
 	}
 }
 
-// gcmCipher describes AES-GCM with a fixed key length. The parameters are
-// the GCMParameters SEQUENCE.
+// gcmCipher describes AES-GCM with a fixed key length.
 func gcmCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
 	return func(params asn1.RawValue) (contentCipher, error) {
-		var p aesGCMParameters
-		if _, err := asn1.Unmarshal(params.Bytes, &p); err != nil {
+		p, err := parseGCMParameters(params)
+		if err != nil {
 			return contentCipher{}, err
 		}
 		return contentCipher{
 			keyLengths: []int{keyLen},
 			newCipher:  aesCipher(keyLen),
-			gcm:        &p,
+			gcm:        p,
+			legacyAES:  true,
 		}, nil
 	}
+}
+
+// parseGCMParameters decodes the AES-GCM algorithm parameters: the RFC 5084
+// GCMParameters SEQUENCE, or the layout earlier versions of this package
+// wrote, where the SEQUENCE is wrapped in a second one and the nonce is
+// tagged [4].
+func parseGCMParameters(params asn1.RawValue) (*gcmParameters, error) {
+	var p gcmParameters
+	if _, err := asn1.Unmarshal(params.FullBytes, &p); err != nil {
+		var legacy aesGCMParameters
+		if _, err := asn1.Unmarshal(params.Bytes, &legacy); err != nil {
+			return nil, fmt.Errorf("pkcs7: malformed AES-GCM parameters: %v", err)
+		}
+		p = gcmParameters{Nonce: legacy.Nonce, ICVLen: legacy.ICVLen}
+	}
+	// GCM tags are 12 to 16 bytes (RFC 5084 §3.2).
+	if p.ICVLen < 12 || p.ICVLen > 16 {
+		return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
+	}
+	return &p, nil
 }
 
 // rc2CBCCipher describes RC2-CBC. The effective key length comes from the
@@ -244,7 +285,12 @@ func rc2CBCCipher(params asn1.RawValue) (contentCipher, error) {
 }
 
 // DecryptUsingPSK decrypts encrypted data using caller provided
-// pre-shared secret
+// pre-shared secret.
+//
+// For AES content, a key of a different AES size than the labelled
+// algorithm is accepted, because EncryptUsingPSK before v0.5.0 encrypted
+// with whatever key size it was given and labelled the content with the
+// configured algorithm.
 func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
 	data, ok := p7.raw.(encryptedData)
 	if !ok {
@@ -296,11 +342,15 @@ func rc2Params(params asn1.RawValue) (iv []byte, effectiveBits int, err error) {
 	return p.IV, bits, nil
 }
 
-// decrypt decrypts the content with key.
+// decrypt decrypts the content with a caller-provided key. See
+// DecryptUsingPSK for the AES key sizes it accepts.
 func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	cc, err := eci.resolveCipher()
 	if err != nil {
 		return nil, err
+	}
+	if cc.legacyAES && len(key) != cc.keyLengths[0] {
+		cc.newCipher = aes.NewCipher
 	}
 	return eci.decryptWith(cc, key)
 }
@@ -336,14 +386,11 @@ func (eci encryptedContentInfo) decryptWith(cc contentCipher, key []byte) ([]byt
 	}
 
 	if cc.gcm != nil {
-		gcm, err := cipher.NewGCM(block)
+		gcm, err := cipher.NewGCMWithTagSize(block, cc.gcm.ICVLen)
 		if err != nil {
 			return nil, err
 		}
 		if len(cc.gcm.Nonce) != gcm.NonceSize() {
-			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
-		}
-		if cc.gcm.ICVLen != gcm.Overhead() {
 			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
 		}
 		return gcm.Open(nil, cc.gcm.Nonce, cyphertext, nil)
