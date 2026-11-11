@@ -59,7 +59,7 @@ func (p7 *PKCS7) Decrypt(cert *x509.Certificate, pkey crypto.PrivateKey) ([]byte
 		if err != nil {
 			return nil, err
 		}
-		cc, err := data.EncryptedContentInfo.contentCipher()
+		cc, err := data.EncryptedContentInfo.resolveCipher()
 		if err != nil {
 			return nil, err
 		}
@@ -153,16 +153,16 @@ type contentCipherSpec struct {
 var contentCipherSpecs = []contentCipherSpec{
 	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher)},
 	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher)},
-	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aes.NewCipher)},
-	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aes.NewCipher)},
+	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aesCipher(16))},
+	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aesCipher(32))},
 	{OIDEncryptionAlgorithmAES128GCM, gcmCipher(16)},
 	{OIDEncryptionAlgorithmAES256GCM, gcmCipher(32)},
 	{OIDEncryptionAlgorithmRC2CBC, rc2CBCCipher},
 }
 
-// contentCipher looks up the content-encryption algorithm in eci and decodes
+// resolveCipher looks up the content-encryption algorithm in eci and decodes
 // its parameters.
-func (eci encryptedContentInfo) contentCipher() (contentCipher, error) {
+func (eci encryptedContentInfo) resolveCipher() (contentCipher, error) {
 	alg := eci.ContentEncryptionAlgorithm
 	for _, spec := range contentCipherSpecs {
 		if spec.oid.Equal(alg.Algorithm) {
@@ -178,21 +178,22 @@ func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error)) fun
 	return func(params asn1.RawValue) (contentCipher, error) {
 		return contentCipher{
 			keyLengths: []int{keyLen},
-			newCipher:  fixedKeyLength(keyLen, newCipher),
+			newCipher:  newCipher,
 			iv:         params.Bytes,
 		}, nil
 	}
 }
 
-// fixedKeyLength wraps newCipher so that it accepts only keyLen-byte keys.
-// aes.NewCipher alone would accept any AES key size, running AES-256 for
-// content labelled AES-128.
-func fixedKeyLength(keyLen int, newCipher func(key []byte) (cipher.Block, error)) func(key []byte) (cipher.Block, error) {
+// aesCipher returns an AES constructor that accepts only keyLen-byte keys.
+// aes.NewCipher alone accepts every AES key size, so it would run AES-256
+// for content labelled AES-128. The DES constructors already reject other
+// key sizes themselves.
+func aesCipher(keyLen int) func(key []byte) (cipher.Block, error) {
 	return func(key []byte) (cipher.Block, error) {
 		if len(key) != keyLen {
 			return nil, fmt.Errorf("pkcs7: invalid content key length %d, want %d", len(key), keyLen)
 		}
-		return newCipher(key)
+		return aes.NewCipher(key)
 	}
 }
 
@@ -206,7 +207,7 @@ func gcmCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
 		}
 		return contentCipher{
 			keyLengths: []int{keyLen},
-			newCipher:  fixedKeyLength(keyLen, aes.NewCipher),
+			newCipher:  aesCipher(keyLen),
 			gcm:        &p,
 		}, nil
 	}
@@ -297,7 +298,7 @@ func rc2Params(params asn1.RawValue) (iv []byte, effectiveBits int, err error) {
 
 // decrypt decrypts the content with key.
 func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
-	cc, err := eci.contentCipher()
+	cc, err := eci.resolveCipher()
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +306,7 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 }
 
 // decryptWith decrypts the content with key using the algorithm resolved by
-// contentCipher.
+// resolveCipher.
 func (eci encryptedContentInfo) decryptWith(cc contentCipher, key []byte) ([]byte, error) {
 	// EncryptedContent can either be constructed of multple OCTET STRINGs
 	// or _be_ a tagged OCTET STRING

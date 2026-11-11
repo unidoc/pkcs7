@@ -69,7 +69,7 @@ func TestDecryptImplicitRejection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cc, err := p7.raw.(envelopedData).EncryptedContentInfo.contentCipher()
+			cc, err := p7.raw.(envelopedData).EncryptedContentInfo.resolveCipher()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -154,7 +154,7 @@ func TestDecryptBadPaddingKeyIsDeterministic(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cc, err := probe.contentCipher()
+			cc, err := probe.resolveCipher()
 			if err != nil {
 				t.Fatal(err)
 			}

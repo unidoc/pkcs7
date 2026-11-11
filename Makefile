@@ -23,7 +23,3 @@ gosimple:
 
 staticcheck:
 	staticcheck .
-
-gettools:
-	go get -u honnef.co/go/tools/...
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1

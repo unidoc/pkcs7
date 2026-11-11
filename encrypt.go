@@ -110,6 +110,11 @@ func encryptAESGCM(content []byte, key []byte, alg int) ([]byte, *encryptedConte
 	default:
 		return nil, nil, fmt.Errorf("invalid content encryption algorithm in encryptAESGCM: %d", alg)
 	}
+	if key != nil && len(key) != keyLen {
+		// aes.NewCipher accepts every AES key size, so a 32-byte key would
+		// produce AES-256 content labelled AES-128, which cannot be decrypted.
+		return nil, nil, fmt.Errorf("pkcs7: invalid content key length %d, want %d", len(key), keyLen)
+	}
 	if key == nil {
 		// Create AES key
 		key = make([]byte, keyLen)
@@ -223,6 +228,10 @@ func encryptAESCBC(content []byte, key []byte, alg int) ([]byte, *encryptedConte
 		algID = OIDEncryptionAlgorithmAES256CBC
 	default:
 		return nil, nil, fmt.Errorf("invalid content encryption algorithm in encryptAESCBC: %d", alg)
+	}
+	if key != nil && len(key) != keyLen {
+		// See encryptAESGCM.
+		return nil, nil, fmt.Errorf("pkcs7: invalid content key length %d, want %d", len(key), keyLen)
 	}
 
 	if key == nil {

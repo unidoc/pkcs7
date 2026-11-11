@@ -63,20 +63,15 @@ var errBERTruncated = errors.New("ber2der: length is more than available data")
 func ber2der(data []byte) ([]byte, error) {
 	out := new(bytes.Buffer)
 
-	obj, rest, err := readObject(data, 0)
+	// Bytes after the top-level value are ignored: PDF signature contents
+	// are padded to a reserved size, and detached signature files often end
+	// with a newline.
+	obj, _, err := readObject(data, 0)
 	if err != nil {
 		return nil, err
 	}
 	if isEndOfContents(obj) {
 		return nil, errors.New("ber2der: unexpected end-of-contents octets")
-	}
-	// PDF signatures reserve space for the CMS value and pad it with zero
-	// bytes, so zeros may follow the value. Anything else is rejected, so
-	// that bytes outside the value cannot ride along unnoticed.
-	for _, b := range rest {
-		if b != 0 {
-			return nil, errors.New("ber2der: trailing data after the top-level value")
-		}
 	}
 	obj.EncodeTo(out)
 
@@ -154,17 +149,59 @@ func isEndOfContents(obj asn1Object) bool {
 	return ok && po.length == 0 && po.tagBytes[0] == 0
 }
 
+// maxTagContinuation is the most continuation octets a high-tag-number form
+// tag may have: 28 bits of tag number, more than any real use.
+const maxTagContinuation = 4
+
+// readTag returns the identifier octets at the start of data and the data
+// after them. Tag numbers up to 30 take one octet. Larger ones use the
+// high-tag-number form (X.690 8.1.2.4): the low five bits are all set and
+// the number follows in base 128, high bit set on all but the last octet.
+func readTag(data []byte) (tag, rest []byte, err error) {
+	if len(data) == 0 {
+		return nil, nil, errBERTruncated
+	}
+	if data[0]&0x1F != 0x1F {
+		return data[:1], data[1:], nil
+	}
+	if len(data) > 1 && data[1] == 0x80 {
+		// 8.1.2.4.2 c: the first continuation octet must not be zero.
+		return nil, nil, errors.New("ber2der: BER tag number has leading zero")
+	}
+	number := 0
+	for i := 1; ; i++ {
+		if i >= len(data) {
+			return nil, nil, errBERTruncated
+		}
+		if i > maxTagContinuation {
+			return nil, nil, errors.New("ber2der: BER tag number too long")
+		}
+		number = number<<7 | int(data[i]&0x7F)
+		if data[i]&0x80 == 0 {
+			if number < 0x1F {
+				// 8.1.2.2: numbers below 31 use the single-octet form.
+				return nil, nil, errors.New("ber2der: BER tag number is not minimal")
+			}
+			return data[:i+1], data[i+1:], nil
+		}
+	}
+}
+
 // readObject reads one BER value from the start of data and returns it with
 // the data that follows it. depth is the number of constructed values
 // enclosing it. The returned object aliases data rather than copying it.
 func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error) {
-	if len(data) < 2 {
+	tagBytes, data, err := readTag(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(data) == 0 {
 		return nil, nil, errBERTruncated
 	}
-	tagB, l := data[0], data[1]
-	data = data[2:]
+	l := data[0]
+	data = data[1:]
 
-	primitive := tagB&0x20 == 0
+	primitive := tagBytes[0]&0x20 == 0
 
 	length := int(l & 0x7F)
 	// A definite length of zero (0x00) is an empty value, not the indefinite
@@ -198,7 +235,7 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		data = data[numberOfBytes:]
 	}
 
-	if tagB == 0 && length != 0 {
+	if tagBytes[0] == 0 && length != 0 {
 		// Tag 0 is only valid as the end-of-contents octets (X.690 8.1.5).
 		return nil, nil, errors.New("ber2der: tag 0 with content")
 	}
@@ -208,7 +245,7 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 			return nil, nil, errBERTruncated
 		}
 		obj = asn1Primitive{
-			tagBytes: []byte{tagB},
+			tagBytes: tagBytes,
 			length:   length,
 			content:  data[:length],
 		}
@@ -256,7 +293,7 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		}
 	}
 	obj = asn1Structured{
-		tagBytes: []byte{tagB},
+		tagBytes: tagBytes,
 		content:  subObjects,
 	}
 	return obj, rest, nil

@@ -3,6 +3,7 @@ package pkcs7
 import (
 	"bytes"
 	"crypto/x509"
+	"strings"
 	"testing"
 )
 
@@ -76,6 +77,33 @@ func TestEncryptUsingPSK(t *testing.T) {
 		}
 		if !bytes.Equal(plaintext, result) {
 			t.Errorf("encrypted data does not match plaintext:\n\tExpected: %s\n\tActual: %s", plaintext, result)
+		}
+	}
+}
+
+func TestEncryptUsingPSKWrongKeyLength(t *testing.T) {
+	// A key of the wrong length must be rejected when encrypting, not
+	// silently used to produce content labelled with the wrong algorithm.
+	defer func(alg int) { ContentEncryptionAlgorithm = alg }(ContentEncryptionAlgorithm)
+	for _, alg := range []int{EncryptionAlgorithmAES128GCM, EncryptionAlgorithmAES256GCM} {
+		ContentEncryptionAlgorithm = alg
+		for _, n := range []int{8, 16, 24, 32} {
+			want := 16
+			if alg == EncryptionAlgorithmAES256GCM {
+				want = 32
+			}
+			_, err := EncryptUsingPSK([]byte("secret"), make([]byte, n))
+			if n == want && err != nil {
+				t.Errorf("alg %d, %d-byte key: %v", alg, n, err)
+			}
+			if n != want && (err == nil || !strings.Contains(err.Error(), "invalid content key length")) {
+				t.Errorf("alg %d, %d-byte key: got %v, want key length error", alg, n, err)
+			}
+		}
+	}
+	for _, alg := range []int{EncryptionAlgorithmAES128CBC, EncryptionAlgorithmAES256CBC} {
+		if _, _, err := encryptAESCBC([]byte("secret"), make([]byte, 24), alg); err == nil {
+			t.Errorf("encryptAESCBC alg %d with a 24-byte key: no error", alg)
 		}
 	}
 }
