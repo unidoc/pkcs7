@@ -69,11 +69,11 @@ func TestDecryptImplicitRejection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			lengths, err := p7.raw.(envelopedData).EncryptedContentInfo.contentKeyLengths()
+			cc, err := p7.raw.(envelopedData).EncryptedContentInfo.resolveCipher()
 			if err != nil {
 				t.Fatal(err)
 			}
-			keyLen := lengths[0]
+			keyLen := cc.keyLengths[0]
 			encrypt := func(k []byte) []byte {
 				ek, err := rsa.EncryptPKCS1v15(rand.Reader, pub, k)
 				if err != nil {
@@ -154,12 +154,12 @@ func TestDecryptBadPaddingKeyIsDeterministic(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			lengths, err := probe.contentKeyLengths()
+			cc, err := probe.resolveCipher()
 			if err != nil {
 				t.Fatal(err)
 			}
-			keyLen := lengths[0]
-			eci, err := enc(implicitRejectionKey(priv, ek, keyLen))
+			keyLen := cc.keyLengths[0]
+			eci, err := enc(implicitRejectionKey(implicitRejectionKDK(priv), ek, keyLen))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -201,7 +201,7 @@ func TestDecryptCiphertextEncodings(t *testing.T) {
 		t.Fatal(err)
 	}
 	plaintext := []byte("short encoding")
-	_, eci, err := encryptAESCBC(plaintext, implicitRejectionKey(priv, ek, 16), EncryptionAlgorithmAES128CBC)
+	_, eci, err := encryptAESCBC(plaintext, implicitRejectionKey(implicitRejectionKDK(priv), ek, 16), EncryptionAlgorithmAES128CBC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestDecryptRC2PrefersTransportedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Content that opens cleanly under the 5-byte fallback key.
-	eci := rc2EncryptedContent(t, implicitRejectionKey(priv, canonical, 5), 40, v40, decoy)
+	eci := rc2EncryptedContent(t, implicitRejectionKey(implicitRejectionKDK(priv), canonical, 5), 40, v40, decoy)
 	ias, err := cert2issuerAndSerial(cert)
 	if err != nil {
 		t.Fatal(err)
@@ -358,21 +358,21 @@ func TestImplicitRejectionKey(t *testing.T) {
 	c1, c2 := randomBytes(t, priv.Size()), randomBytes(t, priv.Size())
 
 	for _, n := range []int{8, 16, 24, 32, 33, 128} {
-		k := implicitRejectionKey(priv, c1, n)
+		k := implicitRejectionKey(implicitRejectionKDK(priv), c1, n)
 		if len(k) != n {
 			t.Fatalf("n=%d: got %d bytes", n, len(k))
 		}
-		if !bytes.Equal(k, implicitRejectionKey(priv, c1, n)) {
+		if !bytes.Equal(k, implicitRejectionKey(implicitRejectionKDK(priv), c1, n)) {
 			t.Errorf("n=%d: not deterministic", n)
 		}
-		if bytes.Equal(k, implicitRejectionKey(priv, c2, n)) {
+		if bytes.Equal(k, implicitRejectionKey(implicitRejectionKDK(priv), c2, n)) {
 			t.Errorf("n=%d: same key for different ciphertexts", n)
 		}
-		if bytes.Equal(k, implicitRejectionKey(otherPriv, c1, n)) {
+		if bytes.Equal(k, implicitRejectionKey(implicitRejectionKDK(otherPriv), c1, n)) {
 			t.Errorf("n=%d: same key for different private keys", n)
 		}
 		// Keys of different lengths must be unrelated, not prefixes.
-		if longer := implicitRejectionKey(priv, c1, n+1); bytes.Equal(k, longer[:n]) {
+		if longer := implicitRejectionKey(implicitRejectionKDK(priv), c1, n+1); bytes.Equal(k, longer[:n]) {
 			t.Errorf("n=%d: key is a prefix of the %d-byte key", n, n+1)
 		}
 	}

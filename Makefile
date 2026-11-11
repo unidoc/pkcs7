@@ -1,4 +1,4 @@
-all: vet unused gosimple staticcheck test
+all: vet test
 
 test:
 	go test -covermode=count -coverprofile=coverage.out .
@@ -14,16 +14,3 @@ vet:
 
 lint:
 	golangci-lint run
-
-unused:
-	unused .
-
-gosimple:
-	gosimple .
-
-staticcheck:
-	staticcheck .
-
-gettools:
-	go get -u honnef.co/go/tools/...
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
