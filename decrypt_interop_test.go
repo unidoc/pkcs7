@@ -13,6 +13,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/unidoc/pkcs7/internal/rc2"
@@ -321,9 +322,21 @@ func TestParseGCMParameters(t *testing.T) {
 		return rv
 	}
 	standard := append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x10)
-	legacy, err := asn1.Marshal(aesGCMParameters{Nonce: nonce, ICVLen: 16})
-	if err != nil {
-		t.Fatal(err)
+	// legacyParams encodes the pre-v0.5.0 layout: a primitive-tagged
+	// SEQUENCE around the [4]-tagged struct.
+	legacyParams := func(icvLen int) []byte {
+		inner, err := asn1.Marshal(aesGCMParameters{Nonce: nonce, ICVLen: icvLen})
+		if err != nil {
+			t.Fatal(err)
+		}
+		outer, err := asn1.Marshal(asn1.RawValue{Tag: asn1.TagSequence, Bytes: inner})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return outer
+	}
+	if got := legacyParams(16)[:2]; !bytes.Equal(got, []byte{0x10, 0x13}) {
+		t.Fatalf("legacy layout starts % X, want 10 13", got)
 	}
 	for name, tt := range map[string]struct {
 		params asn1.RawValue
@@ -331,7 +344,8 @@ func TestParseGCMParameters(t *testing.T) {
 	}{
 		"standard":            {raw(standard), 16},
 		"standard, no ICVlen": {raw(append([]byte{0x30, 0x0E, 0x04, 0x0C}, nonce...)), 12},
-		"legacy":              {asn1.RawValue{Tag: asn1.TagSequence, Bytes: legacy}, 16},
+		"standard, 12":        {raw(append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0C)), 12},
+		"legacy":              {raw(legacyParams(16)), 16},
 	} {
 		p, err := parseGCMParameters(tt.params)
 		if err != nil {
@@ -342,14 +356,56 @@ func TestParseGCMParameters(t *testing.T) {
 			t.Errorf("%s: nonce % X, ICVlen %d", name, p.Nonce, p.ICVLen)
 		}
 	}
-	for name, params := range map[string][]byte{
-		"ICVlen too short": append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0B),
-		"ICVlen too long":  append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x11),
-		"not a sequence":   append([]byte{0x04, 0x0C}, nonce...),
+	for name, tt := range map[string]struct {
+		params  []byte
+		wantErr string
+	}{
+		"ICVlen too short":       {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0B), "parameters are incorrect"},
+		"ICVlen too long":        {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x11), "parameters are incorrect"},
+		"not a sequence":         {append([]byte{0x04, 0x0C}, nonce...), "not a SEQUENCE"},
+		"standard, nonce tagged": {append(append([]byte{0x30, 0x11, 0x84, 0x0C}, nonce...), 0x02, 0x01, 0x10), "malformed AES-GCM parameters: asn1: structure error"},
+		"legacy, ICVlen 12":      {legacyParams(12), "parameters are incorrect"},
+		"legacy, ICVlen 16 only": {legacyParams(15), "parameters are incorrect"},
 	} {
-		if _, err := parseGCMParameters(raw(params)); err == nil {
-			t.Errorf("%s: no error", name)
+		_, err := parseGCMParameters(raw(tt.params))
+		if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+			t.Errorf("%s: got %v, want %q", name, err, tt.wantErr)
 		}
+	}
+}
+
+// TestDecryptAESGCMRejectsTruncatedTag checks that the tag length of content
+// written in the pre-v0.5.0 parameter layout cannot be shortened. A GCM tag
+// is a prefix of the longer tag for the same key and nonce, so accepting a
+// shorter declared length would let anyone cut the tag of existing content.
+func TestDecryptAESGCMRejectsTruncatedTag(t *testing.T) {
+	defer func(alg int) { ContentEncryptionAlgorithm = alg }(ContentEncryptionAlgorithm)
+	ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
+	key := []byte("128BitKey4AESGCM")
+	der, err := EncryptUsingPSK([]byte("hello world"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p7, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eci := p7.raw.(encryptedData).EncryptedContentInfo
+	var p gcmParameters
+	if _, err := asn1.Unmarshal(eci.ContentEncryptionAlgorithm.Parameters.FullBytes, &p); err != nil {
+		t.Fatal(err)
+	}
+	inner, _ := asn1.Marshal(aesGCMParameters{Nonce: p.Nonce, ICVLen: 12})
+	outer, _ := asn1.Marshal(asn1.RawValue{Tag: asn1.TagSequence, Bytes: inner})
+	var raw asn1.RawValue
+	if _, err := asn1.Unmarshal(outer, &raw); err != nil {
+		t.Fatal(err)
+	}
+	eci.ContentEncryptionAlgorithm.Parameters = raw
+	ct := eci.EncryptedContent.Bytes
+	eci.EncryptedContent = marshalEncryptedContent(ct[:len(ct)-4])
+	if got, err := eci.decrypt(key); err == nil {
+		t.Errorf("truncated tag accepted, decrypted %q", got)
 	}
 }
 

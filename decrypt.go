@@ -138,17 +138,44 @@ type contentCipher struct {
 	iv []byte
 	// gcm holds the AES-GCM parameters, or nil for a CBC algorithm.
 	gcm *gcmParameters
-	// legacyAES marks an AES algorithm. Earlier versions of EncryptUsingPSK
-	// used whatever AES key size the caller passed and labelled the content
-	// with the configured algorithm, so DecryptUsingPSK accepts the other
-	// AES key sizes for such content.
-	legacyAES bool
+	// legacy, when set, lists key sizes the label does not allow but
+	// DecryptUsingPSK accepts anyway, with the constructor to use for them.
+	legacy *legacyKeys
+}
+
+// legacyKeys describes key sizes accepted for content that earlier versions
+// of this package wrote with a key the label does not allow.
+type legacyKeys struct {
+	sizes     []int
+	newCipher func(key []byte) (cipher.Block, error)
+}
+
+// legacyAESKeys covers AES content: EncryptUsingPSK before v0.5.0 used
+// whatever AES key size it was given and labelled the content with the
+// configured algorithm.
+var legacyAESKeys = &legacyKeys{sizes: []int{16, 24, 32}, newCipher: aes.NewCipher}
+
+func (l *legacyKeys) accepts(n int) bool {
+	for _, size := range l.sizes {
+		if n == size {
+			return true
+		}
+	}
+	return false
 }
 
 // gcmParameters is GCMParameters from RFC 5084 §3.2.
 type gcmParameters struct {
 	Nonce  []byte
 	ICVLen int `asn1:"optional,default:12"`
+}
+
+// aesGCMParameters is the AES-GCM parameter layout this package wrote
+// before v0.5.0: this SEQUENCE, with the nonce tagged [4], inside a
+// primitive-tagged outer SEQUENCE. decrypt still reads it.
+type aesGCMParameters struct {
+	Nonce  []byte `asn1:"tag:4"`
+	ICVLen int
 }
 
 // contentCipherSpec ties a content-encryption algorithm OID to the decoding
@@ -162,10 +189,10 @@ type contentCipherSpec struct {
 // can decrypt. Both key selection and content decryption consult it, and the
 // cipher constructors enforce the key lengths, so the two cannot drift apart.
 var contentCipherSpecs = []contentCipherSpec{
-	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher)},
-	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher)},
-	{OIDEncryptionAlgorithmAES128CBC, aesCBCCipher(16)},
-	{OIDEncryptionAlgorithmAES256CBC, aesCBCCipher(32)},
+	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher, nil)},
+	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher, nil)},
+	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aesCipher(16), legacyAESKeys)},
+	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aesCipher(32), legacyAESKeys)},
 	{OIDEncryptionAlgorithmAES128GCM, gcmCipher(16)},
 	{OIDEncryptionAlgorithmAES256GCM, gcmCipher(32)},
 	{OIDEncryptionAlgorithmRC2CBC, rc2CBCCipher},
@@ -185,23 +212,14 @@ func (eci encryptedContentInfo) resolveCipher() (contentCipher, error) {
 
 // cbcCipher describes a CBC algorithm with a fixed key length whose
 // parameters are the bare IV.
-func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error)) func(asn1.RawValue) (contentCipher, error) {
+func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error), legacy *legacyKeys) func(asn1.RawValue) (contentCipher, error) {
 	return func(params asn1.RawValue) (contentCipher, error) {
 		return contentCipher{
 			keyLengths: []int{keyLen},
 			newCipher:  newCipher,
 			iv:         params.Bytes,
+			legacy:     legacy,
 		}, nil
-	}
-}
-
-// aesCBCCipher describes AES-CBC with a fixed key length.
-func aesCBCCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
-	resolve := cbcCipher(keyLen, aesCipher(keyLen))
-	return func(params asn1.RawValue) (contentCipher, error) {
-		cc, err := resolve(params)
-		cc.legacyAES = true
-		return cc, err
 	}
 }
 
@@ -229,29 +247,40 @@ func gcmCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
 			keyLengths: []int{keyLen},
 			newCipher:  aesCipher(keyLen),
 			gcm:        p,
-			legacyAES:  true,
+			legacy:     legacyAESKeys,
 		}, nil
 	}
 }
 
-// parseGCMParameters decodes the AES-GCM algorithm parameters: the RFC 5084
-// GCMParameters SEQUENCE, or the layout earlier versions of this package
-// wrote, where the SEQUENCE is wrapped in a second one and the nonce is
-// tagged [4].
+// parseGCMParameters decodes the AES-GCM algorithm parameters. A
+// constructed SEQUENCE is RFC 5084 GCMParameters; the primitive-tagged
+// SEQUENCE this package wrote before v0.5.0 is the aesGCMParameters layout.
 func parseGCMParameters(params asn1.RawValue) (*gcmParameters, error) {
+	if params.Class != asn1.ClassUniversal || params.Tag != asn1.TagSequence {
+		return nil, errors.New("pkcs7: malformed AES-GCM parameters: not a SEQUENCE")
+	}
 	var p gcmParameters
-	if _, err := asn1.Unmarshal(params.FullBytes, &p); err != nil {
-		var legacy aesGCMParameters
-		if _, err := asn1.Unmarshal(params.Bytes, &legacy); err != nil {
+	if params.IsCompound {
+		if _, err := asn1.Unmarshal(params.FullBytes, &p); err != nil {
 			return nil, fmt.Errorf("pkcs7: malformed AES-GCM parameters: %v", err)
 		}
-		p = gcmParameters{Nonce: legacy.Nonce, ICVLen: legacy.ICVLen}
+		// GCM tags are 12 to 16 bytes (RFC 5084 §3.2).
+		if p.ICVLen < 12 || p.ICVLen > 16 {
+			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
+		}
+		return &p, nil
 	}
-	// GCM tags are 12 to 16 bytes (RFC 5084 §3.2).
-	if p.ICVLen < 12 || p.ICVLen > 16 {
+	var legacy aesGCMParameters
+	if _, err := asn1.Unmarshal(params.Bytes, &legacy); err != nil {
+		return nil, fmt.Errorf("pkcs7: malformed AES-GCM parameters: %v", err)
+	}
+	// This layout was only ever written with a 16-byte tag. A shorter one
+	// here is a truncation of ours, since a GCM tag is a prefix of the
+	// longer tag for the same key and nonce.
+	if legacy.ICVLen != 16 {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
 	}
-	return &p, nil
+	return &gcmParameters{Nonce: legacy.Nonce, ICVLen: legacy.ICVLen}, nil
 }
 
 // rc2CBCCipher describes RC2-CBC. The effective key length comes from the
@@ -349,8 +378,8 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cc.legacyAES && len(key) != cc.keyLengths[0] {
-		cc.newCipher = aes.NewCipher
+	if cc.legacy != nil && cc.legacy.accepts(len(key)) {
+		cc.newCipher = cc.legacy.newCipher
 	}
 	return eci.decryptWith(cc, key)
 }

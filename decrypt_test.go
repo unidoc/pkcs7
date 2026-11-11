@@ -3,6 +3,7 @@ package pkcs7
 import (
 	"bytes"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -61,8 +62,9 @@ KJRWUR0wTWfZBPZ5hAYZjTBEAFULaYCXlQKsODSp0M1aQA==
 -----END PRIVATE KEY-----`
 
 func TestDecryptUsingPSKWrongKey(t *testing.T) {
-	// Keys of another length fail, whether or not it is a valid AES size,
-	// and the right key still works.
+	// A key of another AES size is tried and fails authentication; a key
+	// of a size AES does not have is rejected by length; the right key
+	// still works.
 	defer func(alg int) { ContentEncryptionAlgorithm = alg }(ContentEncryptionAlgorithm)
 	ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
 	key := []byte("128BitKey4AESGCM")
@@ -74,10 +76,13 @@ func TestDecryptUsingPSKWrongKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range [][]byte{append(key, key...), key[:8], append(key, key[:8]...)} {
+	for _, k := range [][]byte{append(key, key...), append(key, key[:8]...)} {
 		if _, err := p7.DecryptUsingPSK(k); err == nil {
 			t.Errorf("%d-byte key: no error", len(k))
 		}
+	}
+	if _, err := p7.DecryptUsingPSK(key[:7]); err == nil || !strings.Contains(err.Error(), "invalid content key length 7, want 16") {
+		t.Errorf("7-byte key: got %v, want key length error", err)
 	}
 	if _, err := p7.DecryptUsingPSK(key); err != nil {
 		t.Errorf("correct key: %v", err)

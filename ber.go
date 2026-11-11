@@ -8,6 +8,18 @@ import (
 type asn1Object interface {
 	EncodeTo(writer *bytes.Buffer) error
 	TagBytes() []byte
+	// encodedLen returns the length of the DER encoding, so that a
+	// constructed value can write its length before its content without
+	// first encoding the content into a scratch buffer.
+	encodedLen() int
+}
+
+// encodedLengthLen returns the number of bytes encodeLength writes for n.
+func encodedLengthLen(n int) int {
+	if n < 128 {
+		return 1
+	}
+	return 1 + lengthLength(n)
 }
 
 type asn1Structured struct {
@@ -19,17 +31,30 @@ func (s asn1Structured) TagBytes() []byte {
 	return s.tagBytes
 }
 
-func (s asn1Structured) EncodeTo(out *bytes.Buffer) error {
-	inner := new(bytes.Buffer)
+// contentLen returns the encoded length of the content.
+func (s asn1Structured) contentLen() int {
+	n := 0
 	for _, obj := range s.content {
-		err := obj.EncodeTo(inner)
-		if err != nil {
+		n += obj.encodedLen()
+	}
+	return n
+}
+
+func (s asn1Structured) encodedLen() int {
+	n := s.contentLen()
+	return len(s.tagBytes) + encodedLengthLen(n) + n
+}
+
+func (s asn1Structured) EncodeTo(out *bytes.Buffer) error {
+	out.Write(s.tagBytes)
+	if err := encodeLength(out, s.contentLen()); err != nil {
+		return err
+	}
+	for _, obj := range s.content {
+		if err := obj.EncodeTo(out); err != nil {
 			return err
 		}
 	}
-	out.Write(s.tagBytes)
-	encodeLength(out, inner.Len())
-	out.Write(inner.Bytes())
 	return nil
 }
 
@@ -40,6 +65,10 @@ type asn1Primitive struct {
 
 func (s asn1Primitive) TagBytes() []byte {
 	return s.tagBytes
+}
+
+func (p asn1Primitive) encodedLen() int {
+	return len(p.tagBytes) + encodedLengthLen(len(p.content)) + len(p.content)
 }
 
 func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
@@ -72,6 +101,7 @@ func ber2der(data []byte) ([]byte, error) {
 	if isEndOfContents(obj) {
 		return nil, errors.New("ber2der: unexpected end-of-contents octets")
 	}
+	out.Grow(obj.encodedLen())
 	obj.EncodeTo(out)
 
 	return out.Bytes(), nil

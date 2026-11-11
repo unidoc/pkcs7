@@ -232,7 +232,13 @@ func TestBer2DerValidUnchanged(t *testing.T) {
 // nestedDefinite returns depth nested definite-length SEQUENCEs around a NULL,
 // with minimal (DER) length encodings.
 func nestedDefinite(depth int) []byte {
-	l := 2
+	return nestedDefiniteAround(depth, []byte{0x05, 0x00})
+}
+
+// nestedDefiniteAround returns depth nested definite-length SEQUENCEs around
+// the encoded value inner.
+func nestedDefiniteAround(depth int, inner []byte) []byte {
+	l := len(inner)
 	headers := make([][]byte, depth)
 	for i := range headers {
 		h := new(bytes.Buffer)
@@ -245,7 +251,29 @@ func nestedDefinite(depth int) []byte {
 	for i := depth - 1; i >= 0; i-- {
 		out = append(out, headers[i]...)
 	}
-	return append(out, 0x05, 0x00)
+	return append(out, inner...)
+}
+
+func TestBer2DerEncodeNoPerLevelCopy(t *testing.T) {
+	// Encoding writes each value straight into the output, so a deep nest
+	// around a large value must not copy the value once per level.
+	payload := append([]byte{0x04, 0x83, 0x10, 0x00, 0x00}, make([]byte, 1<<20)...)
+	nested := nestedDefiniteAround(maxBERNesting-1, payload)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	der, err := ber2der(nested)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(der, nested) {
+		t.Error("DER input did not pass through unchanged")
+	}
+	const limit = 3 << 20 // the output plus slack, not 63 copies of 1 MB
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > limit {
+		t.Errorf("allocated %d bytes, want at most %d", alloc, limit)
+	}
 }
 
 // nestedIndefinite returns depth nested indefinite-length SEQUENCEs around a
