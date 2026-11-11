@@ -138,30 +138,11 @@ type contentCipher struct {
 	iv []byte
 	// gcm holds the AES-GCM parameters, or nil for a CBC algorithm.
 	gcm *gcmParameters
-	// legacy, when set, lists key sizes the label does not allow but
-	// DecryptUsingPSK accepts anyway, with the constructor to use for them.
-	legacy *legacyKeys
-}
-
-// legacyKeys describes key sizes accepted for content that earlier versions
-// of this package wrote with a key the label does not allow.
-type legacyKeys struct {
-	sizes     []int
-	newCipher func(key []byte) (cipher.Block, error)
-}
-
-// legacyAESKeys covers AES content: EncryptUsingPSK before v0.5.0 used
-// whatever AES key size it was given and labelled the content with the
-// configured algorithm.
-var legacyAESKeys = &legacyKeys{sizes: []int{16, 24, 32}, newCipher: aes.NewCipher}
-
-func (l *legacyKeys) accepts(n int) bool {
-	for _, size := range l.sizes {
-		if n == size {
-			return true
-		}
-	}
-	return false
+	// legacyAES lets DecryptUsingPSK use the other AES key sizes as well.
+	// EncryptUsingPSK before v0.5.0 offered AES-GCM only and used whatever
+	// AES key size it was given, labelling the content with the configured
+	// algorithm.
+	legacyAES bool
 }
 
 // gcmParameters is GCMParameters from RFC 5084 §3.2.
@@ -189,10 +170,10 @@ type contentCipherSpec struct {
 // can decrypt. Both key selection and content decryption consult it, and the
 // cipher constructors enforce the key lengths, so the two cannot drift apart.
 var contentCipherSpecs = []contentCipherSpec{
-	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher, nil)},
-	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher, nil)},
-	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aesCipher(16), legacyAESKeys)},
-	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aesCipher(32), legacyAESKeys)},
+	{OIDEncryptionAlgorithmDESCBC, cbcCipher(8, des.NewCipher)},
+	{OIDEncryptionAlgorithmDESEDE3CBC, cbcCipher(24, des.NewTripleDESCipher)},
+	{OIDEncryptionAlgorithmAES128CBC, cbcCipher(16, aesCipher(16))},
+	{OIDEncryptionAlgorithmAES256CBC, cbcCipher(32, aesCipher(32))},
 	{OIDEncryptionAlgorithmAES128GCM, gcmCipher(16)},
 	{OIDEncryptionAlgorithmAES256GCM, gcmCipher(32)},
 	{OIDEncryptionAlgorithmRC2CBC, rc2CBCCipher},
@@ -212,13 +193,12 @@ func (eci encryptedContentInfo) resolveCipher() (contentCipher, error) {
 
 // cbcCipher describes a CBC algorithm with a fixed key length whose
 // parameters are the bare IV.
-func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error), legacy *legacyKeys) func(asn1.RawValue) (contentCipher, error) {
+func cbcCipher(keyLen int, newCipher func(key []byte) (cipher.Block, error)) func(asn1.RawValue) (contentCipher, error) {
 	return func(params asn1.RawValue) (contentCipher, error) {
 		return contentCipher{
 			keyLengths: []int{keyLen},
 			newCipher:  newCipher,
 			iv:         params.Bytes,
-			legacy:     legacy,
 		}, nil
 	}
 }
@@ -247,10 +227,17 @@ func gcmCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
 			keyLengths: []int{keyLen},
 			newCipher:  aesCipher(keyLen),
 			gcm:        p,
-			legacy:     legacyAESKeys,
+			legacyAES:  true,
 		}, nil
 	}
 }
+
+// gcmTagSize is the only GCM tag length accepted. RFC 5084 allows 12 to 16
+// bytes, but the parameters are not authenticated and a GCM tag is a prefix
+// of the longer tag for the same key and nonce, so accepting a shorter
+// declared length would let anyone truncate the tag of existing content.
+// Nothing this package can read writes shorter tags.
+const gcmTagSize = 16
 
 // parseGCMParameters decodes the AES-GCM algorithm parameters. A
 // constructed SEQUENCE is RFC 5084 GCMParameters; the primitive-tagged
@@ -264,23 +251,17 @@ func parseGCMParameters(params asn1.RawValue) (*gcmParameters, error) {
 		if _, err := asn1.Unmarshal(params.FullBytes, &p); err != nil {
 			return nil, fmt.Errorf("pkcs7: malformed AES-GCM parameters: %v", err)
 		}
-		// GCM tags are 12 to 16 bytes (RFC 5084 §3.2).
-		if p.ICVLen < 12 || p.ICVLen > 16 {
-			return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
+	} else {
+		var legacy aesGCMParameters
+		if _, err := asn1.Unmarshal(params.Bytes, &legacy); err != nil {
+			return nil, fmt.Errorf("pkcs7: malformed AES-GCM parameters: %v", err)
 		}
-		return &p, nil
+		p = gcmParameters{Nonce: legacy.Nonce, ICVLen: legacy.ICVLen}
 	}
-	var legacy aesGCMParameters
-	if _, err := asn1.Unmarshal(params.Bytes, &legacy); err != nil {
-		return nil, fmt.Errorf("pkcs7: malformed AES-GCM parameters: %v", err)
-	}
-	// This layout was only ever written with a 16-byte tag. A shorter one
-	// here is a truncation of ours, since a GCM tag is a prefix of the
-	// longer tag for the same key and nonce.
-	if legacy.ICVLen != 16 {
+	if p.ICVLen != gcmTagSize {
 		return nil, errors.New("pkcs7: encryption algorithm parameters are incorrect")
 	}
-	return &gcmParameters{Nonce: legacy.Nonce, ICVLen: legacy.ICVLen}, nil
+	return &p, nil
 }
 
 // rc2CBCCipher describes RC2-CBC. The effective key length comes from the
@@ -378,8 +359,8 @@ func (eci encryptedContentInfo) decrypt(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cc.legacy != nil && cc.legacy.accepts(len(key)) {
-		cc.newCipher = cc.legacy.newCipher
+	if n := len(key); cc.legacyAES && (n == 16 || n == 24 || n == 32) {
+		cc.newCipher = aes.NewCipher
 	}
 	return eci.decryptWith(cc, key)
 }
@@ -415,7 +396,7 @@ func (eci encryptedContentInfo) decryptWith(cc contentCipher, key []byte) ([]byt
 	}
 
 	if cc.gcm != nil {
-		gcm, err := cipher.NewGCMWithTagSize(block, cc.gcm.ICVLen)
+		gcm, err := cipher.NewGCMWithTagSize(block, gcmTagSize)
 		if err != nil {
 			return nil, err
 		}

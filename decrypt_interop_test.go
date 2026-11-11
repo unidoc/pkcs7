@@ -277,16 +277,19 @@ func standardGCMEncryptedData(t *testing.T, oid asn1.ObjectIdentifier, key, plai
 }
 
 func TestDecryptAESGCMStandardParameters(t *testing.T) {
+	// RFC 5084 parameters decrypt with a 16-byte tag. Shorter tags, which
+	// the RFC allows, are rejected: see gcmTagSize.
 	plaintext := []byte("RFC 5084 parameters")
 	for name, tt := range map[string]struct {
 		oid     asn1.ObjectIdentifier
 		keyLen  int
 		tagSize int
+		wantErr bool
 	}{
-		"AES-128-GCM, 16-byte tag":         {OIDEncryptionAlgorithmAES128GCM, 16, 16},
-		"AES-256-GCM, 16-byte tag":         {OIDEncryptionAlgorithmAES256GCM, 32, 16},
-		"AES-128-GCM, default 12-byte tag": {OIDEncryptionAlgorithmAES128GCM, 16, 12},
-		"AES-256-GCM, 13-byte tag":         {OIDEncryptionAlgorithmAES256GCM, 32, 13},
+		"AES-128-GCM, 16-byte tag":         {OIDEncryptionAlgorithmAES128GCM, 16, 16, false},
+		"AES-256-GCM, 16-byte tag":         {OIDEncryptionAlgorithmAES256GCM, 32, 16, false},
+		"AES-128-GCM, default 12-byte tag": {OIDEncryptionAlgorithmAES128GCM, 16, 12, true},
+		"AES-256-GCM, 13-byte tag":         {OIDEncryptionAlgorithmAES256GCM, 32, 13, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			key := make([]byte, tt.keyLen)
@@ -298,6 +301,12 @@ func TestDecryptAESGCMStandardParameters(t *testing.T) {
 				t.Fatal(err)
 			}
 			got, err := p7.DecryptUsingPSK(key)
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "parameters are incorrect") {
+					t.Fatalf("got %v, want parameters error", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -342,10 +351,8 @@ func TestParseGCMParameters(t *testing.T) {
 		params asn1.RawValue
 		icvLen int
 	}{
-		"standard":            {raw(standard), 16},
-		"standard, no ICVlen": {raw(append([]byte{0x30, 0x0E, 0x04, 0x0C}, nonce...)), 12},
-		"standard, 12":        {raw(append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0C)), 12},
-		"legacy":              {raw(legacyParams(16)), 16},
+		"standard": {raw(standard), 16},
+		"legacy":   {raw(legacyParams(16)), 16},
 	} {
 		p, err := parseGCMParameters(tt.params)
 		if err != nil {
@@ -360,8 +367,10 @@ func TestParseGCMParameters(t *testing.T) {
 		params  []byte
 		wantErr string
 	}{
-		"ICVlen too short":       {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0B), "parameters are incorrect"},
-		"ICVlen too long":        {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x11), "parameters are incorrect"},
+		"ICVlen 11":              {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0B), "parameters are incorrect"},
+		"ICVlen 12":              {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x0C), "parameters are incorrect"},
+		"ICVlen omitted (12)":    {append([]byte{0x30, 0x0E, 0x04, 0x0C}, nonce...), "parameters are incorrect"},
+		"ICVlen 17":              {append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x11), "parameters are incorrect"},
 		"not a sequence":         {append([]byte{0x04, 0x0C}, nonce...), "not a SEQUENCE"},
 		"standard, nonce tagged": {append(append([]byte{0x30, 0x11, 0x84, 0x0C}, nonce...), 0x02, 0x01, 0x10), "malformed AES-GCM parameters: asn1: structure error"},
 		"legacy, ICVlen 12":      {legacyParams(12), "parameters are incorrect"},
@@ -374,10 +383,11 @@ func TestParseGCMParameters(t *testing.T) {
 	}
 }
 
-// TestDecryptAESGCMRejectsTruncatedTag checks that the tag length of content
-// written in the pre-v0.5.0 parameter layout cannot be shortened. A GCM tag
-// is a prefix of the longer tag for the same key and nonce, so accepting a
-// shorter declared length would let anyone cut the tag of existing content.
+// TestDecryptAESGCMRejectsTruncatedTag checks that the declared tag length
+// of existing content cannot be shortened in either parameter layout. The
+// parameters are not authenticated, and a GCM tag is a prefix of the longer
+// tag for the same key and nonce, so a shorter declared length plus a cut
+// ciphertext would pass authentication.
 func TestDecryptAESGCMRejectsTruncatedTag(t *testing.T) {
 	defer func(alg int) { ContentEncryptionAlgorithm = alg }(ContentEncryptionAlgorithm)
 	ContentEncryptionAlgorithm = EncryptionAlgorithmAES128GCM
@@ -395,17 +405,33 @@ func TestDecryptAESGCMRejectsTruncatedTag(t *testing.T) {
 	if _, err := asn1.Unmarshal(eci.ContentEncryptionAlgorithm.Parameters.FullBytes, &p); err != nil {
 		t.Fatal(err)
 	}
-	inner, _ := asn1.Marshal(aesGCMParameters{Nonce: p.Nonce, ICVLen: 12})
-	outer, _ := asn1.Marshal(asn1.RawValue{Tag: asn1.TagSequence, Bytes: inner})
-	var raw asn1.RawValue
-	if _, err := asn1.Unmarshal(outer, &raw); err != nil {
-		t.Fatal(err)
+	marshal := func(v interface{}) []byte {
+		b, err := asn1.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
 	}
-	eci.ContentEncryptionAlgorithm.Parameters = raw
-	ct := eci.EncryptedContent.Bytes
-	eci.EncryptedContent = marshalEncryptedContent(ct[:len(ct)-4])
-	if got, err := eci.decrypt(key); err == nil {
-		t.Errorf("truncated tag accepted, decrypted %q", got)
+	legacyInner := marshal(aesGCMParameters{Nonce: p.Nonce, ICVLen: 12})
+	for name, params := range map[string][]byte{
+		"RFC 5084, ICVlen 12": marshal(struct {
+			Nonce  []byte
+			ICVLen int
+		}{p.Nonce, 12}),
+		"RFC 5084, ICVlen omitted": marshal(struct{ Nonce []byte }{p.Nonce}),
+		"legacy, ICVlen 12":        marshal(asn1.RawValue{Tag: asn1.TagSequence, Bytes: legacyInner}),
+	} {
+		var raw asn1.RawValue
+		if _, err := asn1.Unmarshal(params, &raw); err != nil {
+			t.Fatal(err)
+		}
+		forged := eci
+		forged.ContentEncryptionAlgorithm.Parameters = raw
+		ct := eci.EncryptedContent.Bytes
+		forged.EncryptedContent = marshalEncryptedContent(ct[:len(ct)-4])
+		if got, err := forged.decrypt(key); err == nil {
+			t.Errorf("%s: truncated tag accepted, decrypted %q", name, got)
+		}
 	}
 }
 

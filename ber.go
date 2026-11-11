@@ -25,29 +25,22 @@ func encodedLengthLen(n int) int {
 type asn1Structured struct {
 	tagBytes []byte
 	content  []asn1Object
+	// contentLen is the encoded length of content, summed once when the
+	// value is read so that encoding stays linear in the number of values.
+	contentLen int
 }
 
 func (s asn1Structured) TagBytes() []byte {
 	return s.tagBytes
 }
 
-// contentLen returns the encoded length of the content.
-func (s asn1Structured) contentLen() int {
-	n := 0
-	for _, obj := range s.content {
-		n += obj.encodedLen()
-	}
-	return n
-}
-
 func (s asn1Structured) encodedLen() int {
-	n := s.contentLen()
-	return len(s.tagBytes) + encodedLengthLen(n) + n
+	return len(s.tagBytes) + encodedLengthLen(s.contentLen) + s.contentLen
 }
 
 func (s asn1Structured) EncodeTo(out *bytes.Buffer) error {
 	out.Write(s.tagBytes)
-	if err := encodeLength(out, s.contentLen()); err != nil {
+	if err := encodeLength(out, s.contentLen); err != nil {
 		return err
 	}
 	for _, obj := range s.content {
@@ -284,6 +277,7 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		return nil, nil, errors.New("ber2der: BER nesting too deep")
 	}
 	subObjects := make([]asn1Object, 0)
+	contentLen := 0
 	if indefinite {
 		// The content runs until the end-of-contents octets.
 		for {
@@ -300,6 +294,7 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 				break
 			}
 			subObjects = append(subObjects, sobj)
+			contentLen += sobj.encodedLen()
 		}
 		rest = data
 	} else {
@@ -318,11 +313,13 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 				return nil, nil, errors.New("ber2der: unexpected end-of-contents octets")
 			}
 			subObjects = append(subObjects, sobj)
+			contentLen += sobj.encodedLen()
 		}
 	}
 	obj = asn1Structured{
-		tagBytes: tagBytes,
-		content:  subObjects,
+		tagBytes:   tagBytes,
+		content:    subObjects,
+		contentLen: contentLen,
 	}
 	return obj, rest, nil
 }

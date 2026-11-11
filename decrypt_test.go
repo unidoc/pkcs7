@@ -89,6 +89,25 @@ func TestDecryptUsingPSKWrongKey(t *testing.T) {
 	}
 }
 
+func TestDecryptAESCBCWrongKeyLength(t *testing.T) {
+	// EncryptUsingPSK never offered AES-CBC, so there is no legacy AES-CBC
+	// content with a mismatched key and the key length stays strict.
+	key := []byte("128BitKey4AESCBC")
+	_, eci, err := encryptAESCBC([]byte("secret"), key, EncryptionAlgorithmAES128CBC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{24, 32} {
+		_, err := eci.decrypt(make([]byte, n))
+		if err == nil || !strings.Contains(err.Error(), "invalid content key length") {
+			t.Errorf("%d-byte key: got %v, want key length error", n, err)
+		}
+	}
+	if _, err := eci.decrypt(key); err != nil {
+		t.Errorf("correct key: %v", err)
+	}
+}
+
 // legacyPSKFixtures were written by v0.4.2's EncryptUsingPSK with a key of
 // bytes 0, 1, 2, ... of the wrong AES size for the configured algorithm,
 // which it encrypted with anyway. They must stay decryptable.
