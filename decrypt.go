@@ -138,10 +138,9 @@ type contentCipher struct {
 	iv []byte
 	// gcm holds the AES-GCM parameters, or nil for a CBC algorithm.
 	gcm *gcmParameters
-	// legacyAES lets DecryptUsingPSK use the other AES key sizes as well.
-	// EncryptUsingPSK before v0.5.0 offered AES-GCM only and used whatever
-	// AES key size it was given, labelling the content with the configured
-	// algorithm.
+	// legacyAES lets DecryptUsingPSK use the other AES key sizes as well:
+	// legacy AES-GCM content carries whatever AES key size its writer was
+	// given, under the label of the configured algorithm.
 	legacyAES bool
 }
 
@@ -151,9 +150,9 @@ type gcmParameters struct {
 	ICVLen int `asn1:"optional,default:12"`
 }
 
-// aesGCMParameters is the AES-GCM parameter layout this package wrote
-// before v0.5.0: this SEQUENCE, with the nonce tagged [4], inside a
-// primitive-tagged outer SEQUENCE. decrypt still reads it.
+// aesGCMParameters is the legacy AES-GCM parameter layout: this SEQUENCE,
+// with the nonce tagged [4], inside a primitive-tagged outer SEQUENCE.
+// decrypt reads it alongside the RFC 5084 layout.
 type aesGCMParameters struct {
 	Nonce  []byte `asn1:"tag:4"`
 	ICVLen int
@@ -240,8 +239,8 @@ func gcmCipher(keyLen int) func(asn1.RawValue) (contentCipher, error) {
 const gcmTagSize = 16
 
 // parseGCMParameters decodes the AES-GCM algorithm parameters. A
-// constructed SEQUENCE is RFC 5084 GCMParameters; the primitive-tagged
-// SEQUENCE this package wrote before v0.5.0 is the aesGCMParameters layout.
+// constructed SEQUENCE is RFC 5084 GCMParameters; a primitive-tagged
+// SEQUENCE is the legacy aesGCMParameters layout.
 func parseGCMParameters(params asn1.RawValue) (*gcmParameters, error) {
 	if params.Class != asn1.ClassUniversal || params.Tag != asn1.TagSequence {
 		return nil, errors.New("pkcs7: malformed AES-GCM parameters: not a SEQUENCE")
@@ -297,10 +296,9 @@ func rc2CBCCipher(params asn1.RawValue) (contentCipher, error) {
 // DecryptUsingPSK decrypts encrypted data using caller provided
 // pre-shared secret.
 //
-// For AES content, a key of a different AES size than the labelled
-// algorithm is accepted, because EncryptUsingPSK before v0.5.0 encrypted
-// with whatever key size it was given and labelled the content with the
-// configured algorithm.
+// For AES-GCM content, a key of a different AES size than the labelled
+// algorithm is accepted as well, because legacy content carries whatever
+// AES key size its writer was given under the configured label.
 func (p7 *PKCS7) DecryptUsingPSK(key []byte) ([]byte, error) {
 	data, ok := p7.raw.(encryptedData)
 	if !ok {

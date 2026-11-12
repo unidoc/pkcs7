@@ -7,7 +7,6 @@ import (
 
 type asn1Object interface {
 	EncodeTo(writer *bytes.Buffer) error
-	TagBytes() []byte
 	// encodedLen returns the length of the DER encoding, so that a
 	// constructed value can write its length before its content without
 	// first encoding the content into a scratch buffer.
@@ -28,10 +27,6 @@ type asn1Structured struct {
 	// contentLen is the encoded length of content, summed once when the
 	// value is read so that encoding stays linear in the number of values.
 	contentLen int
-}
-
-func (s asn1Structured) TagBytes() []byte {
-	return s.tagBytes
 }
 
 func (s asn1Structured) encodedLen() int {
@@ -56,8 +51,61 @@ type asn1Primitive struct {
 	content  []byte
 }
 
-func (s asn1Primitive) TagBytes() []byte {
-	return s.tagBytes
+// asn1String is a constructed string value merged into its primitive form.
+// It keeps its segments, which alias the input, and writes their bodies one
+// after another when encoded, so merging copies no content and each nesting
+// level only does work for its own segments.
+type asn1String struct {
+	tag      byte // primitive tag of the merged value
+	unused   byte // BIT STRING unused-bits octet of the merged value
+	segments []asn1Object
+	bodyLen  int // content length, without the BIT STRING unused-bits octet
+}
+
+// isBitString reports whether s is a BIT STRING, whose segments each carry
+// an unused-bits octet.
+func (s asn1String) isBitString() bool {
+	return s.tag == 3
+}
+
+func (s asn1String) contentLen() int {
+	if s.isBitString() {
+		return s.bodyLen + 1
+	}
+	return s.bodyLen
+}
+
+func (s asn1String) encodedLen() int {
+	n := s.contentLen()
+	return 1 + encodedLengthLen(n) + n
+}
+
+func (s asn1String) EncodeTo(out *bytes.Buffer) error {
+	out.WriteByte(s.tag)
+	if err := encodeLength(out, s.contentLen()); err != nil {
+		return err
+	}
+	if s.isBitString() {
+		out.WriteByte(s.unused)
+	}
+	s.writeBody(out)
+	return nil
+}
+
+// writeBody writes the segment bodies, without BIT STRING unused-bits octets.
+func (s asn1String) writeBody(out *bytes.Buffer) {
+	for _, seg := range s.segments {
+		switch v := seg.(type) {
+		case asn1Primitive:
+			if s.isBitString() {
+				out.Write(v.content[1:])
+			} else {
+				out.Write(v.content)
+			}
+		case asn1String:
+			v.writeBody(out)
+		}
+	}
 }
 
 func (p asn1Primitive) encodedLen() int {
@@ -124,7 +172,7 @@ func lengthLength(i int) (numBytes int) {
 	return
 }
 
-// encodes the length in DER format
+// encodeLength encodes the length in DER format.
 // If the length fits in 7 bits, the value is encoded directly.
 //
 // Otherwise, the number of bytes to encode the length is first determined.
@@ -132,12 +180,12 @@ func lengthLength(i int) (numBytes int) {
 // added to 0x80. The length is encoded in big endian encoding follow after
 //
 // Examples:
-//  length | byte 1 | bytes n
-//  0      | 0x00   | -
-//  120    | 0x78   | -
-//  200    | 0x81   | 0xC8
-//  500    | 0x82   | 0x01 0xF4
 //
+//	length | byte 1 | bytes n
+//	0      | 0x00   | -
+//	120    | 0x78   | -
+//	200    | 0x81   | 0xC8
+//	500    | 0x82   | 0x01 0xF4
 func encodeLength(out *bytes.Buffer, length int) (err error) {
 	if length >= 128 {
 		l := lengthLength(length)
@@ -236,30 +284,38 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 			return nil, nil, errors.New("ber2der: indefinite length on primitive tag")
 		}
 		indefinite = true
+	} else if l == 0xFF {
+		// X.690 8.1.3.5 c: reserved for future extensions.
+		return nil, nil, errors.New("ber2der: reserved length octet 0xFF")
 	} else if l > 0x80 {
 		numberOfBytes := length
-		if numberOfBytes > 4 { // int is only guaranteed to be 32bit
-			return nil, nil, errors.New("ber2der: BER tag length too long")
-		}
 		if len(data) < numberOfBytes {
 			return nil, nil, errBERTruncated
 		}
-		if numberOfBytes == 4 && data[0] > 0x7F {
-			return nil, nil, errors.New("ber2der: BER tag length is negative")
+		lengthOctets := data[:numberOfBytes]
+		data = data[numberOfBytes:]
+		// BER allows leading zero octets in a length (X.690 8.1.3.5); the
+		// DER output re-encodes it minimally.
+		for len(lengthOctets) > 0 && lengthOctets[0] == 0 {
+			lengthOctets = lengthOctets[1:]
 		}
-		if data[0] == 0 {
-			return nil, nil, errors.New("ber2der: BER tag length has leading zero")
+		// int is only guaranteed to be 32 bits.
+		if len(lengthOctets) > 4 || len(lengthOctets) == 4 && lengthOctets[0] > 0x7F {
+			return nil, nil, errors.New("ber2der: BER tag length too long")
 		}
 		length = 0
-		for _, sl := range data[:numberOfBytes] {
+		for _, sl := range lengthOctets {
 			length = length<<8 | int(sl)
 		}
-		data = data[numberOfBytes:]
 	}
 
 	if tagBytes[0] == 0 && length != 0 {
 		// Tag 0 is only valid as the end-of-contents octets (X.690 8.1.5).
 		return nil, nil, errors.New("ber2der: tag 0 with content")
+	}
+	if tagBytes[0] == 0 && l != 0 {
+		// The end-of-contents octets are exactly 00 00 (X.690 8.1.5).
+		return nil, nil, errors.New("ber2der: end-of-contents octets with a long-form length")
 	}
 
 	if primitive {
@@ -277,7 +333,6 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		return nil, nil, errors.New("ber2der: BER nesting too deep")
 	}
 	subObjects := make([]asn1Object, 0)
-	contentLen := 0
 	if indefinite {
 		// The content runs until the end-of-contents octets.
 		for {
@@ -294,7 +349,6 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 				break
 			}
 			subObjects = append(subObjects, sobj)
-			contentLen += sobj.encodedLen()
 		}
 		rest = data
 	} else {
@@ -313,8 +367,17 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 				return nil, nil, errors.New("ber2der: unexpected end-of-contents octets")
 			}
 			subObjects = append(subObjects, sobj)
-			contentLen += sobj.encodedLen()
 		}
+	}
+	if isConstructedString(tagBytes) {
+		if obj, err = mergeConstructedString(tagBytes[0], subObjects); err != nil {
+			return nil, nil, err
+		}
+		return obj, rest, nil
+	}
+	contentLen := 0
+	for _, sobj := range subObjects {
+		contentLen += sobj.encodedLen()
 	}
 	obj = asn1Structured{
 		tagBytes:   tagBytes,
@@ -322,4 +385,86 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		contentLen: contentLen,
 	}
 	return obj, rest, nil
+}
+
+// isConstructedString reports whether tag is the identifier octet of a
+// universal string type in constructed form (X.690 8.21). DER requires
+// string types in primitive form (10.2), so their segments are merged.
+// Implicitly tagged strings cannot be recognised without the schema and
+// are left as they are.
+func isConstructedString(tag []byte) bool {
+	if len(tag) != 1 || tag[0]&0xC0 != 0 || tag[0]&0x20 == 0 {
+		return false
+	}
+	switch tag[0] & 0x1F {
+	case 3, // BIT STRING
+		4,  // OCTET STRING
+		7,  // ObjectDescriptor
+		12, // UTF8String
+		18, // NumericString
+		19, // PrintableString
+		20, // T61String
+		21, // VideotexString
+		22, // IA5String
+		23, // UTCTime
+		24, // GeneralizedTime
+		25, // GraphicString
+		26, // VisibleString
+		27, // GeneralString
+		28, // UniversalString
+		30: // BMPString
+		return true
+	}
+	return false
+}
+
+// mergeConstructedString returns the primitive form of a constructed string
+// value from its segments (X.690 8.21). A nested constructed segment has
+// already been merged by readObject. BIT STRING segments are BIT STRINGs
+// (8.6.4) and OCTET STRING segments are OCTET STRINGs; the other string
+// types are encoded as an implicit OCTET STRING (8.23.5), so their segments
+// are OCTET STRINGs, and segments of the type's own tag are accepted too.
+func mergeConstructedString(tag byte, segments []asn1Object) (asn1String, error) {
+	merged := asn1String{tag: tag &^ 0x20, segments: segments}
+	bitString := merged.isBitString()
+	for i, seg := range segments {
+		var segTag, unused byte
+		var bodyLen int
+		switch v := seg.(type) {
+		case asn1Primitive:
+			if len(v.tagBytes) != 1 {
+				return asn1String{}, errors.New("ber2der: constructed string segment of a different type")
+			}
+			segTag, bodyLen = v.tagBytes[0], len(v.content)
+			if bitString && segTag == 3 {
+				if bodyLen == 0 {
+					return asn1String{}, errors.New("ber2der: BIT STRING segment without unused-bits octet")
+				}
+				unused, bodyLen = v.content[0], bodyLen-1
+			}
+		case asn1String:
+			segTag, unused, bodyLen = v.tag, v.unused, v.bodyLen
+		default:
+			return asn1String{}, errors.New("ber2der: constructed string segment of a different type")
+		}
+		if segTag != merged.tag && (bitString || segTag != 4) {
+			return asn1String{}, errors.New("ber2der: constructed string segment of a different type")
+		}
+		if bitString {
+			// Only the last segment may leave bits unused (8.6.4), at most
+			// 7, and only when it has bits at all (8.6.2.3).
+			if unused > 7 {
+				return asn1String{}, errors.New("ber2der: BIT STRING with more than 7 unused bits")
+			}
+			if unused != 0 && bodyLen == 0 {
+				return asn1String{}, errors.New("ber2der: BIT STRING segment with unused bits but no bits")
+			}
+			if unused != 0 && i != len(segments)-1 {
+				return asn1String{}, errors.New("ber2der: BIT STRING segment with unused bits before the last")
+			}
+			merged.unused = unused
+		}
+		merged.bodyLen += bodyLen
+	}
+	return merged, nil
 }
