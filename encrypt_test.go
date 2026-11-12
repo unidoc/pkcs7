@@ -111,7 +111,7 @@ func TestEncryptUsingPSKWrongKeyLength(t *testing.T) {
 
 func TestEncryptAESGCMParametersRFC5084(t *testing.T) {
 	// The parameters must be a constructed GCMParameters SEQUENCE with an
-	// OCTET STRING nonce and the tag length, not the pre-v0.5.0 layout.
+	// OCTET STRING nonce and the tag length, not the legacy layout.
 	for _, alg := range []int{EncryptionAlgorithmAES128GCM, EncryptionAlgorithmAES256GCM} {
 		_, eci, err := encryptAESGCM([]byte("x"), nil, alg)
 		if err != nil {

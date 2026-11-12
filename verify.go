@@ -200,30 +200,19 @@ func parseSignedData(data []byte) (*PKCS7, error) {
 	}
 	// fmt.Printf("--> Signed Data Version %d\n", sd.Version)
 
-	var compound asn1.RawValue
-	var content unsignedData
+	var eContent asn1.RawValue
 
 	// The Content.Bytes maybe empty on PKI responses.
 	if len(sd.ContentInfo.Content.Bytes) > 0 {
-		if _, err := asn1.Unmarshal(sd.ContentInfo.Content.Bytes, &compound); err != nil {
+		if _, err := asn1.Unmarshal(sd.ContentInfo.Content.Bytes, &eContent); err != nil {
 			return nil, err
 		}
 	}
-	// Compound octet string
-	if compound.IsCompound {
-		if compound.Tag == 4 {
-			if _, err = asn1.Unmarshal(compound.Bytes, &content); err != nil {
-				return nil, err
-			}
-		} else {
-			content = compound.Bytes
-		}
-	} else {
-		// assuming this is tag 04
-		content = compound.Bytes
-	}
+	// ber2der has merged a segmented eContent OCTET STRING into one
+	// primitive, so Bytes is the whole content; for other content types it
+	// is the contents octets of the value.
 	return &PKCS7{
-		Content:      content,
+		Content:      eContent.Bytes,
 		Certificates: certs,
 		CRLs:         sd.CRLs,
 		Signers:      sd.SignerInfos,
