@@ -21,12 +21,12 @@ import (
 )
 
 func SignAndDetach(content []byte, cert *x509.Certificate, privkey *rsa.PrivateKey) (signed []byte, err error) {
-	toBeSigned, err := NewSignedData(content)
+	toBeSigned, err := pkcs7.NewSignedData(content)
 	if err != nil {
 		err = fmt.Errorf("Cannot initialize signed data: %s", err)
 		return
 	}
-	if err = toBeSigned.AddSigner(cert, privkey, SignerInfoConfig{}); err != nil {
+	if err = toBeSigned.AddSigner(cert, privkey, pkcs7.SignerInfoConfig{}); err != nil {
 		err = fmt.Errorf("Cannot add signer: %s", err)
 		return
 	}

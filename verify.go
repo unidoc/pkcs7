@@ -210,7 +210,11 @@ func parseSignedData(data []byte) (*PKCS7, error) {
 	}
 	// ber2der has merged a segmented eContent OCTET STRING into one
 	// primitive, so Bytes is the whole content; for other content types it
-	// is the contents octets of the value.
+	// is the contents octets of the value. An OCTET STRING still in
+	// constructed form has segments that do not merge.
+	if eContent.Class == asn1.ClassUniversal && eContent.Tag == asn1.TagOctetString && eContent.IsCompound {
+		return nil, errors.New("pkcs7: malformed segmented content")
+	}
 	return &PKCS7{
 		Content:      eContent.Bytes,
 		Certificates: certs,

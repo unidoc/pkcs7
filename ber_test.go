@@ -65,24 +65,11 @@ func TestBer2Der_Negatives(t *testing.T) {
 		{[]byte{0x9F, 0x80, 0x01, 0xAA}, "ber2der: BER tag number has leading zero"},
 		{[]byte{0x9F, 0x05, 0x01, 0xAA}, "ber2der: BER tag number is not minimal"},
 		{[]byte{0x9F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x01, 0xAA}, "ber2der: BER tag number too long"},
-		// Constructed strings: segments must be primitives of the same type.
-		{[]byte{0x24, 0x80, 0x04, 0x01, 0xAA, 0x0C, 0x01, 0x42, 0x00, 0x00}, "ber2der: constructed string segment of a different type"},
-		{[]byte{0x24, 0x04, 0x30, 0x02, 0x05, 0x00}, "ber2der: constructed string segment of a different type"},
-		{[]byte{0x24, 0x05, 0x24, 0x03, 0x0C, 0x01, 0x41}, "ber2der: constructed string segment of a different type"},
-		// BIT STRING segments: unused bits only in the last one, at most 7.
-		{[]byte{0x23, 0x80, 0x03, 0x02, 0x04, 0xAA, 0x03, 0x02, 0x00, 0xB0, 0x00, 0x00}, "ber2der: BIT STRING segment with unused bits before the last"},
-		{[]byte{0x23, 0x02, 0x03, 0x00}, "ber2der: BIT STRING segment without unused-bits octet"},
-		{[]byte{0x23, 0x04, 0x03, 0x02, 0x08, 0xAA}, "ber2der: BIT STRING with more than 7 unused bits"},
-		{[]byte{0x23, 0x80, 0x03, 0x02, 0x00, 0xAA, 0x03, 0x01, 0x04, 0x00, 0x00}, "ber2der: BIT STRING segment with unused bits but no bits"},
-		{[]byte{0x23, 0x80, 0x23, 0x80, 0x03, 0x02, 0x04, 0xAA, 0x00, 0x00, 0x03, 0x02, 0x00, 0xBB, 0x00, 0x00}, "ber2der: BIT STRING segment with unused bits before the last"},
-		// BIT STRING segments must be BIT STRINGs, OCTET STRING ones OCTET STRINGs.
-		{[]byte{0x23, 0x80, 0x04, 0x02, 0x00, 0xAA, 0x00, 0x00}, "ber2der: constructed string segment of a different type"},
-		{[]byte{0x24, 0x80, 0x0C, 0x01, 0x41, 0x00, 0x00}, "ber2der: constructed string segment of a different type"},
-		{[]byte{0x2C, 0x80, 0x13, 0x01, 0x41, 0x00, 0x00}, "ber2der: constructed string segment of a different type"},
-		// Length octet 0xFF is reserved; end-of-contents is exactly 00 00.
+		// Length octet 0xFF is reserved; tag 0 is only the end-of-contents 00 00.
 		{append(append([]byte{0x04, 0xFF}, make([]byte, 126)...), 0x01, 0xAA), "ber2der: reserved length octet 0xFF"},
-		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x81, 0x00}, "ber2der: end-of-contents octets with a long-form length"},
-		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x82, 0x00, 0x00}, "ber2der: end-of-contents octets with a long-form length"},
+		{[]byte{0x00, 0x01, 0xAA}, "ber2der: tag 0 is only valid as the end-of-contents octets 00 00"},
+		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x81, 0x00}, "ber2der: tag 0 is only valid as the end-of-contents octets 00 00"},
+		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x82, 0x00, 0x00}, "ber2der: tag 0 is only valid as the end-of-contents octets 00 00"},
 	}
 
 	for _, fixture := range fixtures {
@@ -309,6 +296,22 @@ func TestBer2DerValidUnchanged(t *testing.T) {
 			[]byte{0x03, 0x02, 0x00, 0xAA},
 		},
 		{
+			"merged BIT STRING padding bits are zeroed (X.690 11.2.1)",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x00, 0xAA, 0x03, 0x02, 0x04, 0xBF, 0x00, 0x00},
+			[]byte{0x03, 0x03, 0x04, 0xAA, 0xB0},
+		},
+		// Segments that do not merge leave the value in constructed form.
+		{
+			"constructed OCTET STRING with a UTF8String segment stays constructed",
+			[]byte{0x24, 0x80, 0x04, 0x01, 0xAA, 0x0C, 0x01, 0x42, 0x00, 0x00},
+			[]byte{0x24, 0x06, 0x04, 0x01, 0xAA, 0x0C, 0x01, 0x42},
+		},
+		{
+			"constructed BIT STRING with unused bits in a middle segment stays constructed",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x04, 0xAA, 0x03, 0x02, 0x00, 0xB0, 0x00, 0x00},
+			[]byte{0x23, 0x08, 0x03, 0x02, 0x04, 0xAA, 0x03, 0x02, 0x00, 0xB0},
+		},
+		{
 			"constructed string inside a sequence",
 			[]byte{0x30, 0x80, 0x24, 0x80, 0x04, 0x01, 0xAA, 0x00, 0x00, 0x00, 0x00},
 			[]byte{0x30, 0x03, 0x04, 0x01, 0xAA},
@@ -364,14 +367,55 @@ func nestedDefiniteAround(depth int, inner []byte) []byte {
 	return append(out, inner...)
 }
 
+// readSegments decodes each encoded value into the segment list
+// mergeConstructedString takes.
+func readSegments(t *testing.T, encoded ...[]byte) []asn1Object {
+	t.Helper()
+	segs := make([]asn1Object, 0, len(encoded))
+	for _, b := range encoded {
+		obj, rest, err := readObject(b, 1)
+		if err != nil || len(rest) != 0 {
+			t.Fatalf("segment % X: err %v, rest % X", b, err, rest)
+		}
+		segs = append(segs, obj)
+	}
+	return segs
+}
+
+func TestMergeConstructedStringRejections(t *testing.T) {
+	fixtures := []struct {
+		name     string
+		tag      byte
+		segments [][]byte
+		wantErr  string
+	}{
+		{"OCTET STRING with a UTF8String segment", 0x24, [][]byte{{0x04, 0x01, 0xAA}, {0x0C, 0x01, 0x42}}, "segment of a different type"},
+		{"OCTET STRING with a SEQUENCE segment", 0x24, [][]byte{{0x30, 0x02, 0x05, 0x00}}, "segment of a different type"},
+		{"OCTET STRING with a nested UTF8String", 0x24, [][]byte{{0x24, 0x03, 0x0C, 0x01, 0x41}}, "segment of a different type"},
+		{"BIT STRING with an OCTET STRING segment", 0x23, [][]byte{{0x04, 0x02, 0x00, 0xAA}}, "segment of a different type"},
+		{"UTF8String with a PrintableString segment", 0x2C, [][]byte{{0x13, 0x01, 0x41}}, "segment of a different type"},
+		{"BIT STRING unused bits in a middle segment", 0x23, [][]byte{{0x03, 0x02, 0x04, 0xAA}, {0x03, 0x02, 0x00, 0xB0}}, "unused bits before the last"},
+		{"BIT STRING segment without the unused-bits octet", 0x23, [][]byte{{0x03, 0x00}}, "without unused-bits octet"},
+		{"BIT STRING with 8 unused bits", 0x23, [][]byte{{0x03, 0x02, 0x08, 0xAA}}, "more than 7 unused bits"},
+		{"BIT STRING unused bits but no bits", 0x23, [][]byte{{0x03, 0x02, 0x00, 0xAA}, {0x03, 0x01, 0x04}}, "unused bits but no bits"},
+		{"nested BIT STRING unused bits before the last", 0x23, [][]byte{{0x23, 0x04, 0x03, 0x02, 0x04, 0xAA}, {0x03, 0x02, 0x00, 0xBB}}, "unused bits before the last"},
+	}
+	for _, f := range fixtures {
+		_, err := mergeConstructedString(f.tag, readSegments(t, f.segments...))
+		if err == nil || !strings.Contains(err.Error(), f.wantErr) {
+			t.Errorf("%s: got %v, want %q", f.name, err, f.wantErr)
+		}
+	}
+}
+
 func TestBer2DerConstructedStringNoPerLevelCopy(t *testing.T) {
 	// Merging a constructed string must not copy its content once per
 	// nesting level: a large payload under the deepest allowed chain of
 	// two-segment constructed OCTET STRINGs.
-	in := append([]byte{0x04, 0x83, 0x10, 0x00, 0x00}, make([]byte, 1<<20)...)
-	for i := 0; i < maxBERNesting-1; i++ {
-		in = append(append([]byte{0x24, 0x80}, in...), 0x04, 0x01, 0xAA, 0x00, 0x00)
-	}
+	in := bytes.Repeat([]byte{0x24, 0x80}, maxBERNesting-1)
+	in = append(in, 0x04, 0x83, 0x10, 0x00, 0x00)
+	in = append(in, make([]byte, 1<<20)...)
+	in = append(in, bytes.Repeat([]byte{0x04, 0x01, 0xAA, 0x00, 0x00}, maxBERNesting-1)...)
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)

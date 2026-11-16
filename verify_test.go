@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -632,6 +633,27 @@ func TestVerifyOpenSSLStreamed(t *testing.T) {
 	}
 	if err := p7.Verify(); err != nil {
 		t.Errorf("Verify: %v", err)
+	}
+}
+
+func TestParseRejectsUnmergeableContent(t *testing.T) {
+	// A segmented eContent whose segments cannot be merged stays a
+	// constructed OCTET STRING and must be a parse error, not content made
+	// of the segment encodings that fails the digest later.
+	der, err := os.ReadFile(filepath.Join("testdata", "openssl_stream_signed.der"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Retag the second eContent segment as a UTF8String.
+	second := []byte{0x04, 0x82, 0x03, 0xB0}
+	if bytes.Count(der, second) != 1 {
+		t.Fatalf("second segment header found %d times", bytes.Count(der, second))
+	}
+	bad := append([]byte(nil), der...)
+	bad[bytes.Index(bad, second)] = 0x0C
+	_, err = Parse(bad)
+	if err == nil || !strings.Contains(err.Error(), "malformed segmented content") {
+		t.Errorf("got %v, want malformed segmented content", err)
 	}
 }
 

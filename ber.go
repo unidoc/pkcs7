@@ -89,6 +89,13 @@ func (s asn1String) EncodeTo(out *bytes.Buffer) error {
 		out.WriteByte(s.unused)
 	}
 	s.writeBody(out)
+	if s.isBitString() && s.unused != 0 {
+		// DER requires the unused bits to be zero (X.690 11.2.1). The
+		// merged value never has unused bits without a body, so the last
+		// octet written is the one that carries them.
+		b := out.Bytes()
+		b[len(b)-1] &= 0xFF << s.unused
+	}
 	return nil
 }
 
@@ -309,13 +316,10 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		}
 	}
 
-	if tagBytes[0] == 0 && length != 0 {
-		// Tag 0 is only valid as the end-of-contents octets (X.690 8.1.5).
-		return nil, nil, errors.New("ber2der: tag 0 with content")
-	}
 	if tagBytes[0] == 0 && l != 0 {
-		// The end-of-contents octets are exactly 00 00 (X.690 8.1.5).
-		return nil, nil, errors.New("ber2der: end-of-contents octets with a long-form length")
+		// Tag 0 is only valid as the end-of-contents octets, which are
+		// exactly 00 00 (X.690 8.1.5).
+		return nil, nil, errors.New("ber2der: tag 0 is only valid as the end-of-contents octets 00 00")
 	}
 
 	if primitive {
@@ -370,10 +374,13 @@ func readObject(data []byte, depth int) (obj asn1Object, rest []byte, err error)
 		}
 	}
 	if isConstructedString(tagBytes) {
-		if obj, err = mergeConstructedString(tagBytes[0], subObjects); err != nil {
-			return nil, nil, err
+		// A value whose segments do not merge is kept in constructed form,
+		// so that a malformed string in a part of the input nobody reads,
+		// such as an unsigned attribute, does not fail the whole parse.
+		// A caller that needs the primitive form sees the constructed tag.
+		if merged, err := mergeConstructedString(tagBytes[0], subObjects); err == nil {
+			return merged, rest, nil
 		}
-		return obj, rest, nil
 	}
 	contentLen := 0
 	for _, sobj := range subObjects {
@@ -418,6 +425,10 @@ func isConstructedString(tag []byte) bool {
 	return false
 }
 
+// errSegmentType is returned by mergeConstructedString for a segment that
+// is not a string of the right type.
+var errSegmentType = errors.New("ber2der: constructed string segment of a different type")
+
 // mergeConstructedString returns the primitive form of a constructed string
 // value from its segments (X.690 8.21). A nested constructed segment has
 // already been merged by readObject. BIT STRING segments are BIT STRINGs
@@ -430,25 +441,29 @@ func mergeConstructedString(tag byte, segments []asn1Object) (asn1String, error)
 	for i, seg := range segments {
 		var segTag, unused byte
 		var bodyLen int
+		var content []byte
 		switch v := seg.(type) {
 		case asn1Primitive:
 			if len(v.tagBytes) != 1 {
-				return asn1String{}, errors.New("ber2der: constructed string segment of a different type")
+				return asn1String{}, errSegmentType
 			}
-			segTag, bodyLen = v.tagBytes[0], len(v.content)
-			if bitString && segTag == 3 {
-				if bodyLen == 0 {
-					return asn1String{}, errors.New("ber2der: BIT STRING segment without unused-bits octet")
-				}
-				unused, bodyLen = v.content[0], bodyLen-1
-			}
+			segTag, content = v.tagBytes[0], v.content
 		case asn1String:
 			segTag, unused, bodyLen = v.tag, v.unused, v.bodyLen
 		default:
-			return asn1String{}, errors.New("ber2der: constructed string segment of a different type")
+			return asn1String{}, errSegmentType
 		}
 		if segTag != merged.tag && (bitString || segTag != 4) {
-			return asn1String{}, errors.New("ber2der: constructed string segment of a different type")
+			return asn1String{}, errSegmentType
+		}
+		if _, primitive := seg.(asn1Primitive); primitive {
+			bodyLen = len(content)
+			if bitString {
+				if bodyLen == 0 {
+					return asn1String{}, errors.New("ber2der: BIT STRING segment without unused-bits octet")
+				}
+				unused, bodyLen = content[0], bodyLen-1
+			}
 		}
 		if bitString {
 			// Only the last segment may leave bits unused (8.6.4), at most
