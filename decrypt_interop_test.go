@@ -331,8 +331,8 @@ func TestParseGCMParameters(t *testing.T) {
 		return rv
 	}
 	standard := append(append([]byte{0x30, 0x11, 0x04, 0x0C}, nonce...), 0x02, 0x01, 0x10)
-	// legacyParams encodes the pre-v0.5.0 layout: a primitive-tagged
-	// SEQUENCE around the [4]-tagged struct.
+	// legacyParams encodes the legacy layout: a primitive-tagged SEQUENCE
+	// around the [4]-tagged struct.
 	legacyParams := func(icvLen int) []byte {
 		inner, err := asn1.Marshal(aesGCMParameters{Nonce: nonce, ICVLen: icvLen})
 		if err != nil {

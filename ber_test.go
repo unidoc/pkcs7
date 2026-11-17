@@ -46,9 +46,10 @@ func TestBer2Der_Negatives(t *testing.T) {
 		Input         []byte
 		ErrorContains string
 	}{
-		{[]byte{0x30, 0x85}, "tag length too long"},
-		{[]byte{0x30, 0x84, 0x80, 0x0, 0x0, 0x0}, "length is negative"},
-		{[]byte{0x30, 0x82, 0x0, 0x1}, "length has leading zero"},
+		{[]byte{0x30, 0x85, 0x01, 0x0, 0x0, 0x0, 0x0}, "ber2der: BER tag length too long"},
+		{[]byte{0x30, 0x84, 0x80, 0x0, 0x0, 0x0}, "ber2der: BER tag length too long"},
+		{[]byte{0x30, 0x85}, "ber2der: length is more than available data"},
+		{[]byte{0x30, 0x82, 0x0, 0x1}, "ber2der: length is more than available data"},
 		{[]byte{0x30, 0x80, 0x1, 0x2}, "ber2der: length is more than available data"},
 		{[]byte{0x30, 0x03, 0x01, 0x02}, "ber2der: length is more than available data"},
 		{[]byte{0x30, 0x03, 0x30, 0x02, 0x01}, "ber2der: length is more than available data"},
@@ -64,6 +65,11 @@ func TestBer2Der_Negatives(t *testing.T) {
 		{[]byte{0x9F, 0x80, 0x01, 0xAA}, "ber2der: BER tag number has leading zero"},
 		{[]byte{0x9F, 0x05, 0x01, 0xAA}, "ber2der: BER tag number is not minimal"},
 		{[]byte{0x9F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x01, 0xAA}, "ber2der: BER tag number too long"},
+		// Length octet 0xFF is reserved; tag 0 is only the end-of-contents 00 00.
+		{append(append([]byte{0x04, 0xFF}, make([]byte, 126)...), 0x01, 0xAA), "ber2der: reserved length octet 0xFF"},
+		{[]byte{0x00, 0x01, 0xAA}, "ber2der: tag 0 is only valid as the end-of-contents octets 00 00"},
+		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x81, 0x00}, "ber2der: tag 0 is only valid as the end-of-contents octets 00 00"},
+		{[]byte{0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x82, 0x00, 0x00}, "ber2der: tag 0 is only valid as the end-of-contents octets 00 00"},
 	}
 
 	for _, fixture := range fixtures {
@@ -213,6 +219,113 @@ func TestBer2DerValidUnchanged(t *testing.T) {
 			append([]byte{0x04, 0x81, 0x80}, bytes.Repeat([]byte{0xAB}, 128)...),
 			append([]byte{0x04, 0x81, 0x80}, bytes.Repeat([]byte{0xAB}, 128)...),
 		},
+		{
+			"non-minimal long-form length is re-encoded minimally",
+			[]byte{0x04, 0x82, 0x00, 0x01, 0xAA},
+			[]byte{0x04, 0x01, 0xAA},
+		},
+		{
+			"four-octet length with leading zeros",
+			[]byte{0x30, 0x84, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x01},
+			[]byte{0x30, 0x03, 0x02, 0x01, 0x01},
+		},
+		{
+			"five-octet length with leading zeros",
+			[]byte{0x04, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01, 0xAA},
+			[]byte{0x04, 0x01, 0xAA},
+		},
+		// Constructed string types merge into one primitive (X.690 10.2).
+		{
+			"constructed OCTET STRING, indefinite length",
+			[]byte{0x24, 0x80, 0x04, 0x01, 0xAA, 0x04, 0x01, 0xBB, 0x00, 0x00},
+			[]byte{0x04, 0x02, 0xAA, 0xBB},
+		},
+		{
+			"constructed OCTET STRING, definite length",
+			[]byte{0x24, 0x06, 0x04, 0x01, 0xAA, 0x04, 0x01, 0xBB},
+			[]byte{0x04, 0x02, 0xAA, 0xBB},
+		},
+		{
+			"nested constructed OCTET STRING segments flatten",
+			[]byte{0x24, 0x80, 0x24, 0x80, 0x04, 0x01, 0xAA, 0x00, 0x00, 0x04, 0x01, 0xBB, 0x00, 0x00},
+			[]byte{0x04, 0x02, 0xAA, 0xBB},
+		},
+		{
+			"empty constructed OCTET STRING",
+			[]byte{0x24, 0x00},
+			[]byte{0x04, 0x00},
+		},
+		{
+			"constructed BIT STRING takes the last segment's unused bits",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x00, 0xAA, 0x03, 0x02, 0x04, 0xB0, 0x00, 0x00},
+			[]byte{0x03, 0x03, 0x04, 0xAA, 0xB0},
+		},
+		{
+			"empty constructed BIT STRING",
+			[]byte{0x23, 0x00},
+			[]byte{0x03, 0x01, 0x00},
+		},
+		{
+			"constructed UTF8String with OCTET STRING segments (X.690 8.23.5)",
+			[]byte{0x2C, 0x80, 0x04, 0x01, 0x41, 0x04, 0x01, 0x42, 0x00, 0x00},
+			[]byte{0x0C, 0x02, 0x41, 0x42},
+		},
+		{
+			"constructed UTF8String with UTF8String segments",
+			[]byte{0x2C, 0x80, 0x0C, 0x01, 0x41, 0x0C, 0x01, 0x42, 0x00, 0x00},
+			[]byte{0x0C, 0x02, 0x41, 0x42},
+		},
+		{
+			"constructed GeneralizedTime with a nested OCTET STRING segment",
+			[]byte{0x38, 0x80, 0x24, 0x80, 0x04, 0x02, 0x32, 0x30, 0x00, 0x00, 0x04, 0x01, 0x5A, 0x00, 0x00},
+			[]byte{0x18, 0x03, 0x32, 0x30, 0x5A},
+		},
+		{
+			"constructed ObjectDescriptor",
+			[]byte{0x27, 0x80, 0x04, 0x01, 0x41, 0x00, 0x00},
+			[]byte{0x07, 0x01, 0x41},
+		},
+		{
+			"nested constructed BIT STRING keeps the innermost last segment's unused bits",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x00, 0xAA, 0x23, 0x80, 0x03, 0x02, 0x00, 0xBB, 0x03, 0x02, 0x04, 0xC0, 0x00, 0x00, 0x00, 0x00},
+			[]byte{0x03, 0x04, 0x04, 0xAA, 0xBB, 0xC0},
+		},
+		{
+			"empty BIT STRING segment without unused bits",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x00, 0xAA, 0x03, 0x01, 0x00, 0x00, 0x00},
+			[]byte{0x03, 0x02, 0x00, 0xAA},
+		},
+		{
+			"merged BIT STRING padding bits are zeroed (X.690 11.2.1)",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x00, 0xAA, 0x03, 0x02, 0x04, 0xBF, 0x00, 0x00},
+			[]byte{0x03, 0x03, 0x04, 0xAA, 0xB0},
+		},
+		// Segments that do not merge leave the value in constructed form.
+		{
+			"constructed OCTET STRING with a UTF8String segment stays constructed",
+			[]byte{0x24, 0x80, 0x04, 0x01, 0xAA, 0x0C, 0x01, 0x42, 0x00, 0x00},
+			[]byte{0x24, 0x06, 0x04, 0x01, 0xAA, 0x0C, 0x01, 0x42},
+		},
+		{
+			"constructed BIT STRING with unused bits in a middle segment stays constructed",
+			[]byte{0x23, 0x80, 0x03, 0x02, 0x04, 0xAA, 0x03, 0x02, 0x00, 0xB0, 0x00, 0x00},
+			[]byte{0x23, 0x08, 0x03, 0x02, 0x04, 0xAA, 0x03, 0x02, 0x00, 0xB0},
+		},
+		{
+			"constructed string inside a sequence",
+			[]byte{0x30, 0x80, 0x24, 0x80, 0x04, 0x01, 0xAA, 0x00, 0x00, 0x00, 0x00},
+			[]byte{0x30, 0x03, 0x04, 0x01, 0xAA},
+		},
+		{
+			"implicitly tagged constructed value is not merged",
+			[]byte{0xA0, 0x80, 0x04, 0x01, 0xAA, 0x00, 0x00},
+			[]byte{0xA0, 0x03, 0x04, 0x01, 0xAA},
+		},
+		{
+			"constructed SEQUENCE is not a string",
+			[]byte{0x30, 0x06, 0x04, 0x01, 0xAA, 0x04, 0x01, 0xBB},
+			[]byte{0x30, 0x06, 0x04, 0x01, 0xAA, 0x04, 0x01, 0xBB},
+		},
 	}
 	for _, f := range fixtures {
 		der, err := ber2der(f.input)
@@ -252,6 +365,72 @@ func nestedDefiniteAround(depth int, inner []byte) []byte {
 		out = append(out, headers[i]...)
 	}
 	return append(out, inner...)
+}
+
+// readSegments decodes each encoded value into the segment list
+// mergeConstructedString takes.
+func readSegments(t *testing.T, encoded ...[]byte) []asn1Object {
+	t.Helper()
+	segs := make([]asn1Object, 0, len(encoded))
+	for _, b := range encoded {
+		obj, rest, err := readObject(b, 1)
+		if err != nil || len(rest) != 0 {
+			t.Fatalf("segment % X: err %v, rest % X", b, err, rest)
+		}
+		segs = append(segs, obj)
+	}
+	return segs
+}
+
+func TestMergeConstructedStringRejections(t *testing.T) {
+	fixtures := []struct {
+		name     string
+		tag      byte
+		segments [][]byte
+		wantErr  string
+	}{
+		{"OCTET STRING with a UTF8String segment", 0x24, [][]byte{{0x04, 0x01, 0xAA}, {0x0C, 0x01, 0x42}}, "segment of a different type"},
+		{"OCTET STRING with a SEQUENCE segment", 0x24, [][]byte{{0x30, 0x02, 0x05, 0x00}}, "segment of a different type"},
+		{"OCTET STRING with a nested UTF8String", 0x24, [][]byte{{0x24, 0x03, 0x0C, 0x01, 0x41}}, "segment of a different type"},
+		{"BIT STRING with an OCTET STRING segment", 0x23, [][]byte{{0x04, 0x02, 0x00, 0xAA}}, "segment of a different type"},
+		{"UTF8String with a PrintableString segment", 0x2C, [][]byte{{0x13, 0x01, 0x41}}, "segment of a different type"},
+		{"BIT STRING unused bits in a middle segment", 0x23, [][]byte{{0x03, 0x02, 0x04, 0xAA}, {0x03, 0x02, 0x00, 0xB0}}, "unused bits before the last"},
+		{"BIT STRING segment without the unused-bits octet", 0x23, [][]byte{{0x03, 0x00}}, "without unused-bits octet"},
+		{"BIT STRING with 8 unused bits", 0x23, [][]byte{{0x03, 0x02, 0x08, 0xAA}}, "more than 7 unused bits"},
+		{"BIT STRING unused bits but no bits", 0x23, [][]byte{{0x03, 0x02, 0x00, 0xAA}, {0x03, 0x01, 0x04}}, "unused bits but no bits"},
+		{"nested BIT STRING unused bits before the last", 0x23, [][]byte{{0x23, 0x04, 0x03, 0x02, 0x04, 0xAA}, {0x03, 0x02, 0x00, 0xBB}}, "unused bits before the last"},
+	}
+	for _, f := range fixtures {
+		_, err := mergeConstructedString(f.tag, readSegments(t, f.segments...))
+		if err == nil || !strings.Contains(err.Error(), f.wantErr) {
+			t.Errorf("%s: got %v, want %q", f.name, err, f.wantErr)
+		}
+	}
+}
+
+func TestBer2DerConstructedStringNoPerLevelCopy(t *testing.T) {
+	// Merging a constructed string must not copy its content once per
+	// nesting level: a large payload under the deepest allowed chain of
+	// two-segment constructed OCTET STRINGs.
+	in := bytes.Repeat([]byte{0x24, 0x80}, maxBERNesting-1)
+	in = append(in, 0x04, 0x83, 0x10, 0x00, 0x00)
+	in = append(in, make([]byte, 1<<20)...)
+	in = append(in, bytes.Repeat([]byte{0x04, 0x01, 0xAA, 0x00, 0x00}, maxBERNesting-1)...)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	der, err := ber2der(in)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 1<<20 + maxBERNesting - 1; len(der) != 1+encodedLengthLen(want)+want {
+		t.Errorf("output %d bytes, want the payload plus %d segments", len(der), maxBERNesting-1)
+	}
+	const limit = 3 << 20 // the output plus slack, not 63 copies of 1 MB
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > limit {
+		t.Errorf("allocated %d bytes, want at most %d", alloc, limit)
+	}
 }
 
 func TestBer2DerEncodeNoPerLevelCopy(t *testing.T) {
@@ -308,6 +487,17 @@ func TestBer2DerNestingLimit(t *testing.T) {
 	}
 	if _, err := ber2der(nestedIndefinite(maxBERNesting + 1)); err == nil || !strings.Contains(err.Error(), "nesting too deep") {
 		t.Errorf("indefinite nesting past the limit: got %v, want nesting error", err)
+	}
+
+	// Nested constructed string segments count as nesting levels too.
+	segs := append(bytes.Repeat([]byte{0x24, 0x80}, maxBERNesting), 0x04, 0x01, 0xAA)
+	segs = append(segs, bytes.Repeat([]byte{0x00, 0x00}, maxBERNesting)...)
+	if der, err := ber2der(segs); err != nil || !bytes.Equal(der, []byte{0x04, 0x01, 0xAA}) {
+		t.Errorf("constructed string nesting at the limit: der % X, err %v", der, err)
+	}
+	segs = append([]byte{0x24, 0x80}, append(segs, 0x00, 0x00)...)
+	if _, err := ber2der(segs); err == nil || !strings.Contains(err.Error(), "nesting too deep") {
+		t.Errorf("constructed string nesting past the limit: got %v, want nesting error", err)
 	}
 }
 

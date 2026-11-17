@@ -108,9 +108,9 @@ func TestDecryptAESCBCWrongKeyLength(t *testing.T) {
 	}
 }
 
-// legacyPSKFixtures were written by v0.4.2's EncryptUsingPSK with a key of
-// bytes 0, 1, 2, ... of the wrong AES size for the configured algorithm,
-// which it encrypted with anyway. They must stay decryptable.
+// legacyPSKFixtures are EncryptedData written by a legacy EncryptUsingPSK
+// with a key of bytes 0, 1, 2, ... of the wrong AES size for the labelled
+// algorithm, which it encrypted with anyway. They must stay decryptable.
 var legacyPSKFixtures = map[string]struct {
 	keyLen int
 	der    string

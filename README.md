@@ -1,6 +1,6 @@
 # pkcs7
 
-[![GoDoc](https://godoc.org/go.mozilla.org/pkcs7?status.svg)](https://godoc.org/go.mozilla.org/pkcs7)
+[![Go Reference](https://pkg.go.dev/badge/github.com/unidoc/pkcs7.svg)](https://pkg.go.dev/github.com/unidoc/pkcs7)
 [![test](https://github.com/unidoc/pkcs7/actions/workflows/test.yml/badge.svg)](https://github.com/unidoc/pkcs7/actions/workflows/test.yml)
 [![lint](https://github.com/unidoc/pkcs7/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/unidoc/pkcs7/actions/workflows/golangci-lint.yml)
 
@@ -17,16 +17,16 @@ import (
 	"fmt"
 	"os"
 
-    "go.mozilla.org/pkcs7"
+	"github.com/unidoc/pkcs7"
 )
 
 func SignAndDetach(content []byte, cert *x509.Certificate, privkey *rsa.PrivateKey) (signed []byte, err error) {
-	toBeSigned, err := NewSignedData(content)
+	toBeSigned, err := pkcs7.NewSignedData(content)
 	if err != nil {
 		err = fmt.Errorf("Cannot initialize signed data: %s", err)
 		return
 	}
-	if err = toBeSigned.AddSigner(cert, privkey, SignerInfoConfig{}); err != nil {
+	if err = toBeSigned.AddSigner(cert, privkey, pkcs7.SignerInfoConfig{}); err != nil {
 		err = fmt.Errorf("Cannot add signer: %s", err)
 		return
 	}
